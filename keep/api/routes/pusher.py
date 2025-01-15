@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, Form, HTTPException
 from pusher import Pusher
 
-from keep.api.core.dependencies import get_pusher_client, verify_bearer_token
+from keep.api.core.dependencies import get_pusher_client
+from keep.identitymanager.authenticatedentity import AuthenticatedEntity
+from keep.identitymanager.identitymanagerfactory import IdentityManagerFactory
 
 router = APIRouter()
 
@@ -10,7 +12,9 @@ router = APIRouter()
 def pusher_authentication(
     channel_name=Form(...),
     socket_id=Form(...),
-    tenant_id: str = Depends(verify_bearer_token),
+    authenticated_entity: AuthenticatedEntity = Depends(
+        IdentityManagerFactory.get_auth_verifier(["read:pusher"])
+    ),
     pusher_client: Pusher = Depends(get_pusher_client),
 ) -> dict:
     """
@@ -27,6 +31,13 @@ def pusher_authentication(
     Returns:
         dict: The authentication response.
     """
+    tenant_id = authenticated_entity.tenant_id
+    if not pusher_client:
+        raise HTTPException(
+            status_code=500,
+            detail="Pusher client not initalized on backend, PUSHER_DISABLED is set to True?",
+        )
+
     if channel_name == f"private-{tenant_id}":
         auth = pusher_client.authenticate(channel=channel_name, socket_id=socket_id)
         return auth

@@ -1,6 +1,7 @@
 """
 HttpProvider is a class that provides a way to send HTTP requests.
 """
+
 import json
 import typing
 
@@ -47,7 +48,7 @@ class HttpProvider(BaseProvider):
         No configuration to validate here
         """
 
-    def notify(
+    def _notify(
         self,
         url: str,
         method: typing.Literal["GET", "POST", "PUT", "DELETE"],

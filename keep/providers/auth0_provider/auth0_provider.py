@@ -1,6 +1,7 @@
 """
 Auth0 provider.
 """
+
 import dataclasses
 import datetime
 import os
@@ -10,6 +11,7 @@ import requests
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig
+from keep.validation.fields import HttpsUrl
 
 
 @dataclasses.dataclass
@@ -18,26 +20,30 @@ class Auth0ProviderAuthConfig:
     Auth0 authentication configuration.
     """
 
-    token: str = dataclasses.field(
-        default=None,
-        metadata={
-            "required": True,
-            "description": "Auth0 API Token",
-            "hint": "https://manage.auth0.com/dashboard/us/YOUR_ACCOUNT/apis/management/explorer",
-        },
-    )
-    domain: str = dataclasses.field(
-        default=None,
+    domain: HttpsUrl = dataclasses.field(
         metadata={
             "required": True,
             "description": "Auth0 Domain",
-            "hint": "tenantname.us.auth0.com",
+            "hint": "https://tenantname.us.auth0.com",
+            "validation": "https_url",
+        },
+    )
+
+    token: str = dataclasses.field(
+        metadata={
+            "required": True,
+            "sensitive": True,
+            "description": "Auth0 API Token",
+            "hint": "https://manage.auth0.com/dashboard/us/YOUR_ACCOUNT/apis/management/explorer",
         },
     )
 
 
 class Auth0Provider(BaseProvider):
     """Enrich alerts with data from Auth0."""
+
+    PROVIDER_DISPLAY_NAME = "Auth0"
+    PROVIDER_CATEGORY = ["Identity and Access Management"]
 
     provider_id: str
     config: ProviderConfig
@@ -50,10 +56,7 @@ class Auth0Provider(BaseProvider):
     def validate_config(self):
         """
         Validates required configuration for Auth0 provider.
-
         """
-        if self.config.authentication is None:
-            self.config.authentication = {}
         self.authentication_config = Auth0ProviderAuthConfig(
             **self.config.authentication
         )
@@ -72,7 +75,7 @@ class Auth0Provider(BaseProvider):
         Returns:
             _type_: _description_
         """
-        url = f"https://{self.authentication_config.domain}/api/v2/logs"
+        url = f"{self.authentication_config.domain}/api/v2/logs"
         headers = {
             "content-type": "application/json",
             "Authorization": f"Bearer {self.authentication_config.token}",
@@ -84,9 +87,9 @@ class Auth0Provider(BaseProvider):
             "per_page": 100,  # specify the number of entries per page
         }
         if from_:
-            params[
-                "q"
-            ] = f"({params['q']}) AND (date:[{from_} TO {datetime.datetime.now().isoformat()}])"
+            params["q"] = (
+                f"({params['q']}) AND (date:[{from_} TO {datetime.datetime.now().isoformat()}])"
+            )
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         logs = response.json()

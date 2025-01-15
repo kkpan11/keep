@@ -14,9 +14,9 @@ from keep.providers.models.provider_config import ProviderConfig
 
 
 @pydantic.dataclasses.dataclass
-class GitlabPipelinesProviderAuthConfig:
+class GitlabpipelinesProviderAuthConfig:
     """
-    GitlabPipelinesProviderAuthConfig is a class that represents the authentication configuration for the GitlabPipelinesProvider.
+    GitlabpipelinesProviderAuthConfig is a class that represents the authentication configuration for the GitlabPipelinesProvider.
     """
 
     access_token: str = dataclasses.field(
@@ -31,13 +31,16 @@ class GitlabPipelinesProviderAuthConfig:
 class GitlabpipelinesProvider(BaseProvider):
     """Enrich alerts with data from GitLab Pipelines."""
 
+    PROVIDER_DISPLAY_NAME = "GitLab Pipelines"
+    PROVIDER_CATEGORY = ["Developer Tools"]
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
         super().__init__(context_manager, provider_id, config)
 
     def validate_config(self):
-        self.authentication_config = GitlabPipelinesProviderAuthConfig(
+        self.authentication_config = GitlabpipelinesProviderAuthConfig(
             **self.config.authentication
         )
 
@@ -47,10 +50,9 @@ class GitlabpipelinesProvider(BaseProvider):
         """
         pass
 
-    def notify(self, **kwargs):
-        url = kwargs.get("gitlab_url")
-        method = kwargs.get("gitlab_method")
-        method.upper()
+    def _notify(self, gitlab_url: str = "", gitlab_method: str = "", **kwargs):
+        url = gitlab_url
+        method = gitlab_method.upper()
 
         result = self.query(url=url, method=method, **kwargs)
 

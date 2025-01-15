@@ -1,7 +1,9 @@
 """
 BigQuery provider.
 """
+
 import dataclasses
+import json
 import os
 from typing import Optional
 
@@ -19,12 +21,14 @@ class BigqueryProviderAuthConfig:
     BigQuery authentication configuration.
     """
 
-    credentials_path: Optional[str] = dataclasses.field(
-        default=None,
+    service_account_json: str = dataclasses.field(
         metadata={
-            "required": False,
-            "description": "Path to the service account key in JSON format. "
-            "If not provided, will use application default credentials",
+            "required": True,
+            "description": "The service account JSON with container.viewer role",
+            "sensitive": True,
+            "type": "file",
+            "name": "service_account_json",
+            "file_type": "application/json",
         },
     )
     project_id: Optional[str] = dataclasses.field(
@@ -42,6 +46,9 @@ class BigqueryProvider(BaseProvider):
 
     provider_id: str
     config: ProviderConfig
+
+    PROVIDER_DISPLAY_NAME = "BigQuery"
+    PROVIDER_CATEGORY = ["Cloud Infrastructure", "Database"]
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
@@ -76,10 +83,21 @@ class BigqueryProvider(BaseProvider):
                 raise ValueError("BigQuery project id is missing.")
 
     def init_client(self):
-        if self.authentication_config.credentials_path:
-            self.client = bigquery.Client.from_service_account_json(
-                self.authentication_config.service_account_file
-            )
+        if self.authentication_config.service_account_json:
+            # this is the content of the service account json
+            if isinstance(self.authentication_config.service_account_json, dict):
+                self.client = bigquery.Client.from_service_account_info(
+                    self.authentication_config.service_account_json
+                )
+            elif isinstance(self.authentication_config.service_account_json, str):
+                self.client = bigquery.Client.from_service_account_info(
+                    json.loads(self.authentication_config.service_account_json)
+                )
+            # file? should never happen?
+            else:
+                self.client = bigquery.Client.from_service_account_json(
+                    self.authentication_config.service_account_json
+                )
         else:
             self.client = bigquery.Client()
         # check if the project id was set in the environment and use it if exists
@@ -131,7 +149,7 @@ if __name__ == "__main__":
     )
     # If you want to use application default credentials, you can omit the authentication config
     config = {
-        # "authentication": {"credentials_path": "/path/to/your/service_account.json"},
+        # "authentication": {"service_account.json": "/path/to/your/service_account.json"},
         "authentication": {},
     }
 

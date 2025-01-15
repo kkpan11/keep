@@ -1,6 +1,7 @@
 """
 AxiomProvider is a class that allows to ingest/digest data from Axiom.
 """
+
 import dataclasses
 from typing import Optional
 
@@ -35,6 +36,9 @@ class AxiomProviderAuthConfig:
 class AxiomProvider(BaseProvider):
     """Enrich alerts with data from Axiom."""
 
+    PROVIDER_DISPLAY_NAME = "Axiom"
+    PROVIDER_CATEGORY = ["Monitoring"]
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -57,6 +61,7 @@ class AxiomProvider(BaseProvider):
 
     def _query(
         self,
+        dataset=None,
         datasets_api_url=None,
         organization_id=None,
         startTime=None,
@@ -79,7 +84,6 @@ class AxiomProvider(BaseProvider):
         if not organization_id:
             raise Exception("organization_id is required for Axiom provider")
 
-        dataset = kwargs.get("dataset")
         if not dataset:
             raise Exception("dataset is required for Axiom provider")
 

@@ -10,6 +10,9 @@ __pycache__/
 # C extensions
 *.so
 
+# .csv files
+*.csv
+
 # Distribution / packaging
 .Python
 build/
@@ -172,20 +175,47 @@ keep.yaml
 providers.yaml
 .vercel
 keepstate.json
+
 # keep single tenant id
 e1faa321-35df-486b-8fa8-3601ee714011*
+
 # sqlite db
 *.sqlite3
 state/*
-
+.terraform*
 examples/alerts/dd.yml
 keep-ui/node_modules
 keep-ui/node_modules/*
 
 cov.xml
 keep.db
+keepdd.db
 RANDOM_USER_ID
 storage
 
 # otel files
 tempo-data/
+
+# docs
+docs/node_modules/
+
+oauth2.cfg
+
+
+scripts/automatic_extraction_rules.py
+
+playwright_dump_*.html
+playwright_dump_*.png
+
+ee/experimental/ai_temp/*
+,e!ee/experimental/ai_temp/.gitkeep
+
+oauth2.cfg
+scripts/keep_slack_bot.py
+*.db
+providers_cache.json
+
+tests/provision/*
+grafana/*
+!grafana/provisioning/
+!grafana/dashboards/

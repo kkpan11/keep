@@ -4,7 +4,9 @@ import logging.config
 import os
 import sys
 import typing
+import uuid
 from collections import OrderedDict
+from dataclasses import _MISSING_TYPE
 from importlib import metadata
 
 import click
@@ -13,18 +15,19 @@ import yaml
 from dotenv import find_dotenv, load_dotenv
 from prettytable import PrettyTable
 
-from keep.api.core.db import try_create_single_tenant
-from keep.api.core.dependencies import SINGLE_TENANT_UUID
-from keep.cli.click_extensions import NotRequiredIf
-from keep.posthog.posthog import get_posthog_client, get_random_user_id
-from keep.workflowmanager.workflowmanager import WorkflowManager
-from keep.workflowmanager.workflowstore import WorkflowStore
+from keep.api.core.posthog import posthog_client
+from keep.providers.models.provider_config import ProviderScope
+from keep.providers.providers_factory import ProvidersFactory
 
 load_dotenv(find_dotenv())
-posthog_client = get_posthog_client()
 
-RANDOM_USER_ID = get_random_user_id()
-
+try:
+    KEEP_VERSION = metadata.version("keep")
+except metadata.PackageNotFoundError:
+    try:
+        KEEP_VERSION = metadata.version("keephq")
+    except metadata.PackageNotFoundError:
+        KEEP_VERSION = os.environ.get("KEEP_VERSION", "unknown")
 
 logging_config = {
     "version": 1,
@@ -55,10 +58,17 @@ logging_config = {
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_CONF_FILE = ".keep.yaml"
+def get_default_conf_file_path():
+    DEFAULT_CONF_FILE = ".keep.yaml"
+    from pathlib import Path
+
+    home = str(Path.home())
+    return os.path.join(home, DEFAULT_CONF_FILE)
 
 
 def make_keep_request(method, url, **kwargs):
+    if os.environ.get("KEEP_CLI_IGNORE_SSL", "false").lower() == "true":
+        kwargs['verify'] = False
     try:
         response = requests.request(method, url, **kwargs)
         if response.status_code == 401:
@@ -107,11 +117,24 @@ class Info:
             or os.getenv("KEEP_API_URL")
             or Info.KEEP_MANAGED_API_URL
         )
+        self.random_user_id = self.config.get("random_user_id")
+        # if we don't have a random user id, we create one and keep it on the config file
+        if not self.random_user_id:
+            self.random_user_id = str(uuid.uuid4())
+            self.config["random_user_id"] = self.random_user_id
+            with open(file=keep_config, mode="w") as f:
+                yaml.dump(self.config, f)
 
         arguments = sys.argv
 
         # if we auth, we don't need to check for api key
-        if "auth" in arguments or "api" in arguments:
+        if (
+            "auth" in arguments
+            or "api" in arguments
+            or "config" in arguments
+            or "version" in arguments
+            or "build_cache" in arguments
+        ):
             return
 
         if not self.api_key:
@@ -153,9 +176,9 @@ pass_info = click.make_pass_decorator(Info, ensure=True)
 @click.option(
     "--keep-config",
     "-c",
-    help=f"The path to the keep config file (default {DEFAULT_CONF_FILE}",
+    help=f"The path to the keep config file (default {get_default_conf_file_path()}",
     required=False,
-    default=f"{DEFAULT_CONF_FILE}",
+    default=f"{get_default_conf_file_path()}",
 )
 @pass_info
 @click.pass_context
@@ -163,13 +186,16 @@ def cli(ctx, info: Info, verbose: int, json: bool, keep_config: str):
     """Run Keep CLI."""
     # https://posthog.com/tutorials/identifying-users-guide#identifying-and-setting-user-ids-for-every-other-library
     # random user id
-    posthog_client.capture(
-        RANDOM_USER_ID,
-        "keep-cli-started",
-        properties={
-            "args": sys.argv,
-        },
-    )
+    info.set_config(keep_config)
+    if posthog_client is not None:
+        posthog_client.capture(
+            info.random_user_id,
+            "keep-cli-started",
+            properties={
+                "args": sys.argv,
+                "keep_version": KEEP_VERSION,
+            },
+        )
     # Use the verbosity count to determine the logging level...
     if verbose > 0:
         # set the verbosity level to debug
@@ -179,33 +205,85 @@ def cli(ctx, info: Info, verbose: int, json: bool, keep_config: str):
         logging_config["handlers"]["default"]["formatter"] = "json"
     logging.config.dictConfig(logging_config)
     info.verbose = verbose
-    info.set_config(keep_config)
     info.json = json
 
     @ctx.call_on_close
     def cleanup():
-        if posthog_client:
+        if posthog_client is not None:
             posthog_client.flush()
 
 
 @cli.command()
 def version():
     """Get the library version."""
-    click.echo(click.style(f"{metadata.version('keep')}", bold=True))
+    click.echo(click.style(KEEP_VERSION, bold=True))
 
 
-@cli.command()
+@cli.group()
 @pass_info
 def config(info: Info):
-    """Get the config."""
-    keep_url = click.prompt("Enter your keep url", default="http://localhost:8080")
-    api_key = click.prompt(
-        "Enter your api key (leave blank for localhost)", hide_input=True, default=""
-    )
-    with open(f"{DEFAULT_CONF_FILE}", "w") as f:
+    """Manage the config."""
+    pass
+
+
+@config.command(name="show")
+@pass_info
+def show(info: Info):
+    """show the current config."""
+    click.echo(click.style("Current config", bold=True))
+    for key, value in info.config.items():
+        click.echo(f"{key}: {value}")
+
+
+@config.command(name="new")
+@click.option(
+    "--url",
+    "-u",
+    type=str,
+    required=False,
+    is_flag=False,
+    flag_value="http://localhost:8080",
+    help="The url of the keep api",
+)
+@click.option(
+    "--api-key",
+    "-a",
+    type=str,
+    required=False,
+    is_flag=False,
+    flag_value="",
+    help="The api key for keep",
+)
+@click.option(
+    "--interactive",
+    "-i",
+    help="Interactive mode creating keep config (default True)",
+    is_flag=True,
+)
+@pass_info
+def new_config(info: Info, url: str, api_key: str, interactive: bool):
+    """create new config."""
+    ctx = click.get_current_context()
+
+    if not interactive:
+        keep_url = ctx.params.get("url")
+        api_key = ctx.params.get("api_key")
+    else:
+        keep_url = click.prompt("Enter your keep url", default="http://localhost:8080")
+        api_key = click.prompt(
+            "Enter your api key (leave blank for localhost)",
+            hide_input=True,
+            default="",
+        )
+    if not api_key:
+        api_key = "localhost"
+    with open(f"{get_default_conf_file_path()}", "w") as f:
         f.write(f"api_key: {api_key}\n")
         f.write(f"keep_api_url: {keep_url}\n")
-    click.echo(click.style(f"Config file created at {DEFAULT_CONF_FILE}", bold=True))
+        f.write(f"random_user_id: {info.random_user_id}\n")
+    click.echo(
+        click.style(f"Config file created at {get_default_conf_file_path()}", bold=True)
+    )
 
 
 @cli.command()
@@ -234,129 +312,39 @@ def whoami(info: Info):
 
 @cli.command()
 @click.option("--multi-tenant", is_flag=True, help="Enable multi-tenant mode")
-def api(multi_tenant: bool):
+@click.option(
+    "--port",
+    "-p",
+    type=int,
+    default=int(os.environ.get("PORT", 8080)),
+    help="The port to run the API on",
+)
+@click.option(
+    "--host",
+    "-h",
+    type=str,
+    default=os.environ.get("HOST", "0.0.0.0"),
+    help="The host to run the API on",
+)
+def api(multi_tenant: bool, port: int, host: str):
     """Start the API."""
     from keep.api import api
 
     ctx = click.get_current_context()
+
+    api.PORT = ctx.params.get("port")
+    api.HOST = ctx.params.get("host")
+
     if multi_tenant:
         auth_type = "MULTI_TENANT"
     else:
         auth_type = "NO_AUTH"
     app = api.get_app(auth_type=auth_type)
-    logger.info(f"App initialized, multi tenancy: {multi_tenant}")
+    logger.info(
+        f"App initialized, multi tenancy flag from user [overriden by AUTH_TYPE env var]: {multi_tenant}"
+    )
     app.dependency_overrides[click.get_current_context] = lambda: ctx
     api.run(app)
-
-
-@cli.command()
-@click.option(
-    "--alerts-directory",
-    "--alerts-file",
-    "-af",
-    type=click.Path(exists=True, dir_okay=True, file_okay=True),
-    help="The path to the alert yaml/alerts directory",
-)
-@click.option(
-    "--alert-url",
-    "-au",
-    help="A url that can be used to download an alert yaml",
-    cls=NotRequiredIf,
-    multiple=True,
-    not_required_if="alerts_directory",
-)
-@click.option(
-    "--interval",
-    "-i",
-    type=int,
-    help="When interval is set, Keep will run the alert every INTERVAL seconds",
-    required=False,
-    default=0,
-)
-@click.option(
-    "--providers-file",
-    "-p",
-    type=click.Path(exists=False),
-    help="The path to the providers yaml",
-    required=False,
-    default="providers.yaml",
-)
-@click.option(
-    "--tenant-id",
-    "-t",
-    help="The tenant id",
-    required=False,
-    default=SINGLE_TENANT_UUID,
-)
-@click.option("--api-key", help="The API key for keep's API", required=False)
-@click.option(
-    "--api-url",
-    help="The URL for keep's API",
-    required=False,
-    default="https://s.keephq.dev",
-)
-@pass_info
-def run(
-    info: Info,
-    alerts_directory: str,
-    alert_url: list[str],
-    interval: int,
-    providers_file,
-    tenant_id,
-    api_key,
-    api_url,
-):
-    """Run a workflow."""
-    logger.debug(f"Running alert in {alerts_directory or alert_url}")
-    posthog_client.capture(
-        RANDOM_USER_ID,
-        "keep-run-alert-started",
-        properties={
-            "args": sys.argv,
-        },
-    )
-    # this should be fixed
-    workflow_manager = WorkflowManager.get_instance()
-    workflow_store = WorkflowStore()
-    if tenant_id == SINGLE_TENANT_UUID:
-        try_create_single_tenant(SINGLE_TENANT_UUID)
-    workflows = workflow_store.get_workflows_from_path(
-        tenant_id, alerts_directory or alert_url, providers_file
-    )
-    try:
-        workflow_manager.run(workflows)
-    except KeyboardInterrupt:
-        logger.info("Keep stopped by user, stopping the scheduler")
-        posthog_client.capture(
-            RANDOM_USER_ID,
-            "keep-run-stopped-by-user",
-            properties={
-                "args": sys.argv,
-            },
-        )
-        workflow_manager.stop()
-        logger.info("Scheduler stopped")
-    except Exception as e:
-        posthog_client.capture(
-            RANDOM_USER_ID,
-            "keep-run-unexpected-error",
-            properties={
-                "args": sys.argv,
-                "error": str(e),
-            },
-        )
-        logger.error(f"Error running alert {alerts_directory or alert_url}: {e}")
-        if info.verbose:
-            raise e
-        sys.exit(1)
-    posthog_client.capture(
-        RANDOM_USER_ID,
-        "keep-run-alert-finished",
-        properties={
-            "args": sys.argv,
-        },
-    )
-    logger.debug(f"Alert in {alerts_directory or alert_url} ran successfully")
 
 
 @cli.group()
@@ -379,6 +367,10 @@ def list_workflows(info: Info):
         raise Exception(f"Error getting workflows: {resp.text}")
 
     workflows = resp.json()
+    if len(workflows) == 0:
+        click.echo(click.style("No workflows found.", bold=True))
+        return
+
     # Create a new table
     table = PrettyTable()
     # Add column headers
@@ -540,6 +532,10 @@ def list_workflow_executions(info: Info):
         raise Exception(f"Error getting workflow executions: {resp.text}")
 
     workflow_executions = resp.json()
+    if len(workflow_executions) == 0:
+        click.echo(click.style("No workflow executions found.", bold=True))
+        return
+
     # Create a new table
     table = PrettyTable()
     # Add column headers
@@ -592,6 +588,10 @@ def get_workflow_execution_logs(info: Info, workflow_execution_id: str):
     workflow_executions = resp.json()
 
     workflow_execution_logs = workflow_executions[0].get("logs", [])
+    if len(workflow_execution_logs) == 0:
+        click.echo(click.style("No logs found for this workflow execution.", bold=True))
+        return
+
     # Create a new table
     table = PrettyTable()
     # Add column headers
@@ -609,9 +609,401 @@ def get_workflow_execution_logs(info: Info, workflow_execution_id: str):
 
 @cli.group()
 @pass_info
+def mappings(info: Info):
+    """Manage mappings."""
+    pass
+
+
+@mappings.command(name="list")
+@pass_info
+def list_mappings(info: Info):
+    """List mappings."""
+    resp = make_keep_request(
+        "GET",
+        info.keep_api_url + "/mapping",
+        headers={"x-api-key": info.api_key, "accept": "application/json"},
+    )
+    if not resp.ok:
+        raise Exception(f"Error getting mappings: {resp.text}")
+
+    mappings = resp.json()
+    if len(mappings) == 0:
+        click.echo(click.style("No mappings found.", bold=True))
+        return
+
+    # Create a new table
+    table = PrettyTable()
+    # Add column headers
+    table.field_names = [
+        "ID",
+        "Name",
+        "Description",
+        "Priority",
+        "Matchers",
+        "Attributes",
+        "File Name",
+        "Created By",
+        "Creation Time",
+    ]
+
+    # Add rows for each mapping
+    for mapping in mappings:
+        table.add_row(
+            [
+                mapping["id"],
+                mapping["name"],
+                mapping["description"],
+                mapping["priority"],
+                ", ".join(mapping["matchers"]),
+                ", ".join(mapping["attributes"]),
+                mapping["file_name"],
+                mapping["created_by"],
+                mapping["created_at"],
+            ]
+        )
+    print(table)
+
+
+@mappings.command(name="create")
+@click.option(
+    "--name",
+    "-n",
+    type=str,
+    help="The name of the mapping.",
+    required=True,
+)
+@click.option(
+    "--description",
+    "-d",
+    type=str,
+    help="The description of the mapping.",
+    required=False,
+    default="",
+)
+@click.option(
+    "--file",
+    "-f",
+    type=click.Path(exists=True),
+    help="The mapping file. Must be a CSV file.",
+    required=True,
+)
+@click.option(
+    "--matchers",
+    "-m",
+    type=str,
+    help="The matchers of the mapping, as a comma-separated list of strings.",
+    required=True,
+)
+@click.option(
+    "--priority",
+    "-p",
+    type=click.IntRange(0, 100),
+    help="The priority of the mapping, higher priority means this rule will execute first.",
+    required=False,
+    default=0,
+)
+@pass_info
+def create(
+    info: Info, name: str, description: str, file: str, matchers: str, priority: int
+):
+    """Create a mapping rule."""
+    if os.path.isfile(file) and file.endswith(".csv"):
+        with open(file, "rb") as f:
+            file_name = os.path.basename(file)
+            try:
+                csv_data = f.read().decode("utf-8")
+                csv_rows = csv_data.split("\n")
+                csv_headers = csv_rows[0].split(",")
+                csv_rows = csv_rows[1:]
+                rows = []
+                for row in csv_rows:
+                    if row:
+                        row = row.split(",")
+                        rows.append(OrderedDict(zip(csv_headers, row)))
+            except Exception as e:
+                click.echo(click.style(f"Error reading or processing CSV file: {e}"))
+                return
+            mappings_endpoint = info.keep_api_url + "/mapping"
+            response = make_keep_request(
+                "POST",
+                mappings_endpoint,
+                headers={"x-api-key": info.api_key, "accept": "application/json"},
+                json={
+                    "name": name,
+                    "description": description,
+                    "file_name": file_name,
+                    "matchers": matchers.split(","),
+                    "rows": rows,
+                    "priority": priority,
+                },
+            )
+
+        # Check the response
+        if response.ok:
+            click.echo(
+                click.style(f"Mapping rule {file_name} created successfully", bold=True)
+            )
+        else:
+            click.echo(
+                click.style(
+                    f"Error creating mapping rule {file_name}: {response.text}",
+                    bold=True,
+                )
+            )
+
+
+@mappings.command(name="delete")
+@click.option(
+    "--mapping-id",
+    type=int,
+    help="The ID of the mapping to delete.",
+    required=True,
+)
+@pass_info
+def delete_mapping(info: Info, mapping_id: int):
+    """Delete a mapping with a specified ID."""
+
+    # Delete the mapping with the specified ID
+    mappings_endpoint = info.keep_api_url + f"/mapping/{mapping_id}"
+    response = make_keep_request(
+        "DELETE",
+        mappings_endpoint,
+        headers={"x-api-key": info.api_key, "accept": "application/json"},
+    )
+    # Check the response
+    if response.ok:
+        click.echo(
+            click.style(f"Mapping rule {mapping_id} deleted successfully", bold=True)
+        )
+    else:
+        click.echo(
+            click.style(
+                f"Error deleting mapping rule {mapping_id}: {response.text}", bold=True
+            )
+        )
+
+
+@cli.group()
+@pass_info
+def extraction(info: Info):
+    """Manage extractions."""
+    pass
+
+
+@extraction.command(name="list")
+@pass_info
+def list_extraction(info: Info):
+    """List extractions."""
+    resp = make_keep_request(
+        "GET",
+        info.keep_api_url + "/extraction",
+        headers={"x-api-key": info.api_key, "accept": "application/json"},
+    )
+    if not resp.ok:
+        raise Exception(f"Error getting extractions: {resp.text}")
+
+    extractions = resp.json()
+    if len(extractions) == 0:
+        click.echo(click.style("No extractions found.", bold=True))
+        return
+
+    # Create a new table
+    table = PrettyTable()
+    # Add column headers
+    table.field_names = [
+        "ID",
+        "Name",
+        "Description",
+        "Priority",
+        "Attribute",
+        "Condition",
+        "Disabled",
+        "Regex",
+        "Pre",
+        "Created By",
+        "Creation Time",
+        "Updated By",
+        "Update Time",
+    ]
+
+    # Add rows for each extraction
+    for e in extractions:
+        table.add_row(
+            [
+                e["id"],
+                e["name"],
+                e["description"],
+                e["priority"],
+                e["attribute"],
+                e["condition"],
+                e["disabled"],
+                e["regex"],
+                e["pre"],
+                e["created_by"],
+                e["created_at"],
+                e["updated_by"],
+                e["updated_at"],
+            ]
+        )
+    print(table)
+
+
+@extraction.command(name="create")
+@click.option(
+    "--name",
+    "-n",
+    type=str,
+    help="The name of the extraction.",
+    required=True,
+)
+@click.option(
+    "--description",
+    "-d",
+    type=str,
+    help="The description of the extraction.",
+    required=False,
+    default="",
+)
+@click.option(
+    "--priority",
+    "-p",
+    type=click.IntRange(0, 100),
+    help="The priority of the extraction, higher priority means this rule will execute first.",
+    required=False,
+    default=0,
+)
+@click.option(
+    "--pre",
+    type=bool,
+    help="Whether this rule should be applied before or after the alert is standardized.",
+    required=False,
+    default=False,
+)
+@click.option(
+    "--attribute",
+    "-a",
+    type=str,
+    help="Event attribute name to extract from.",
+    required=True,
+    default="",
+)
+@click.option(
+    "--regex",
+    "-r",
+    type=str,
+    help="The regex rule to extract by. Regex format should be like python regex pattern for group matching.",
+    required=True,
+    default="",
+)
+@click.option(
+    "--condition",
+    "-c",
+    type=str,
+    help="CEL based condition.",
+    required=True,
+    default="",
+)
+@pass_info
+def create(
+    info: Info,
+    name: str,
+    description: str,
+    priority: int,
+    pre: bool,
+    attribute: str,
+    regex: str,
+    condition: str,
+):
+    """Create a extraction rule."""
+    response = make_keep_request(
+        "POST",
+        info.keep_api_url + "/extraction",
+        headers={"x-api-key": info.api_key, "accept": "application/json"},
+        json={
+            "name": name,
+            "description": description,
+            "priority": priority,
+            "pre": pre,
+            "attribute": attribute,
+            "regex": regex,
+            "condition": condition,
+        },
+    )
+
+    # Check the response
+    if response.ok:
+        click.echo(
+            click.style(f"Extraction rule {name} created successfully", bold=True)
+        )
+    else:
+        click.echo(
+            click.style(
+                f"Error creating extraction rule {name}: {response.text}",
+                bold=True,
+            )
+        )
+
+
+@extraction.command(name="delete")
+@click.option(
+    "--extraction-id",
+    type=int,
+    help="The ID of the extraction to delete.",
+    required=True,
+)
+@pass_info
+def delete_extraction(info: Info, extraction_id: int):
+    """Delete a extraction with a specified ID."""
+
+    # Delete the extraction with the specified ID
+    response = make_keep_request(
+        "DELETE",
+        info.keep_api_url + f"/extraction/{extraction_id}",
+        headers={"x-api-key": info.api_key, "accept": "application/json"},
+    )
+
+    # Check the response
+    if response.ok:
+        click.echo(
+            click.style(
+                f"Extraction rule {extraction_id} deleted successfully", bold=True
+            )
+        )
+    else:
+        click.echo(
+            click.style(
+                f"Error deleting extraction rule {extraction_id}: {response.text}",
+                bold=True,
+            )
+        )
+
+
+@cli.group()
+@pass_info
 def provider(info: Info):
     """Manage providers."""
     pass
+
+
+@provider.command(name="build_cache", help="Output providers cache for future use")
+def build_cache():
+    class ProviderEncoder(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, ProviderScope):
+                dct = o.__dict__
+                dct.pop("__pydantic_initialised__", None)
+                return dct
+            elif isinstance(o, _MISSING_TYPE):
+                return None
+            return o.dict()
+
+    logger.info("Building providers cache")
+    providers_cache = ProvidersFactory.get_all_providers(ignore_cache_file=True)
+    with open("providers_cache.json", "w") as f:
+        json.dump(providers_cache, f, cls=ProviderEncoder)
+    logger.info(
+        "Providers cache built successfully", extra={"file": "providers_cache.json"}
+    )
 
 
 @provider.command(name="list")
@@ -721,10 +1113,11 @@ def connect(ctx, help: bool, provider_name, provider_type, params):
         ]
         provider_type = provider.get("type")
         for param, details in provider["config"].items():
+            param_as_flag = f"--{param.replace('_', '-')}"
             table.add_row(
                 [
                     provider_type,
-                    param,
+                    param_as_flag,
                     details.get("required", False),
                     details.get("description", "no description"),
                 ]
@@ -849,6 +1242,7 @@ def alert(info: Info):
 )
 @pass_info
 def get_alert(info: Info, fingerprint: str):
+    """Get an alert by fingerprint."""
     resp = _get_alert_by_fingerprint(info.keep_api_url, info.api_key, fingerprint)
     if not resp.ok:
         raise Exception(f"Error getting alert: {resp.text}")
@@ -873,7 +1267,7 @@ def list_alerts(info: Info, filter: typing.List[str], export: bool):
     """List alerts."""
     resp = make_keep_request(
         "GET",
-        info.keep_api_url + "/alerts",
+        info.keep_api_url + "/alerts?sync=true",
         headers={"x-api-key": info.api_key, "accept": "application/json"},
     )
     if not resp.ok:
@@ -888,6 +1282,11 @@ def list_alerts(info: Info, filter: typing.List[str], export: bool):
             aggregated_alerts[alert["fingerprint"]] = alert
 
     alerts = aggregated_alerts.values()
+
+    if len(alerts) == 0:
+        click.echo(click.style("No alerts found.", bold=True))
+        return
+
     # Apply all provided filters
     for filt in filter:
         key, value = filt.split("=")
@@ -981,6 +1380,55 @@ def enrich(info: Info, fingerprint, params):
         )
     else:
         click.echo(click.style(f"Alert {fingerprint} enriched successfully", bold=True))
+
+
+@alert.command()
+@click.option(
+    "--provider-type",
+    "-p",
+    type=click.Path(exists=False),
+    help="The type of the provider which will be used to simulate the alert.",
+    required=True,
+)
+@click.argument("params", nargs=-1, type=click.UNPROCESSED)
+@pass_info
+def simulate(info: Info, provider_type: str, params: list[str]):
+    """Simulate an alert."""
+    click.echo(click.style("Simulating alert", bold=True))
+    try:
+        provider = ProvidersFactory.get_provider_class(provider_type)
+    except Exception as e:
+        click.echo(click.style(f"No such provuder: {e}", bold=True))
+        return
+
+    try:
+        alert = provider.simulate_alert()
+    except Exception:
+        click.echo(click.style("Provider does not support alert simulation", bold=True))
+        return
+    # override the alert with the provided params
+    for param in params:
+        key, value = param.split("=")
+        # if the param contains "."
+        if "." in key:
+            # split the key by "." and set the value in the alert
+            keys = key.split(".")
+            alert[keys[0]][keys[1]] = value
+        else:
+            alert[key] = value
+    click.echo("Simulated alert:")
+    click.echo(json.dumps(alert, indent=4))
+    # send the alert to the server
+    resp = make_keep_request(
+        "POST",
+        info.keep_api_url + f"/alerts/event/{provider_type}",
+        headers={"x-api-key": info.api_key, "accept": "application/json"},
+        json=alert,
+    )
+    if not resp.ok:
+        click.echo(click.style(f"Error simulating alert: {resp.text}", bold=True))
+    else:
+        click.echo(click.style("Alert simulated successfully", bold=True))
 
 
 @cli.group()
@@ -1080,7 +1528,7 @@ def login(info: Info):
 
     api_key = api_key_resp.json().get("apiKey")
     # keep it in the config file
-    with open(f"{DEFAULT_CONF_FILE}", "w") as f:
+    with open(f"{get_default_conf_file_path()}", "w") as f:
         f.write(f"api_key: {api_key}\n")
     # Authenticated successfully
     print("Authenticated successfully!")

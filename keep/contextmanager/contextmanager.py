@@ -1,51 +1,87 @@
 # TODO - refactor context manager to support multitenancy in a more robust way
-import json
 import logging
-import os
 
 import click
+import json5
 from pympler.asizeof import asizeof
 
-from keep.api.core.db import get_session
+from keep.api.core.config import config
+from keep.api.core.db import get_last_workflow_execution_by_workflow_id, get_session
 from keep.api.logging import WorkflowLoggerAdapter
-from keep.storagemanager.storagemanagerfactory import StorageManagerFactory
+from keep.api.models.alert import AlertDto
 
 
 class ContextManager:
-    STATE_FILE = "keepstate.json"
-
     def __init__(
-        self, tenant_id, workflow_id=None, workflow_execution_id=None, load_state=True
+        self,
+        tenant_id,
+        workflow_id=None,
+        workflow_execution_id=None,
+        workflow: dict | None = None,
     ):
         self.logger = logging.getLogger(__name__)
         self.logger_adapter = WorkflowLoggerAdapter(
             self.logger, self, tenant_id, workflow_id, workflow_execution_id
         )
         self.workflow_id = workflow_id
+        self.workflow_execution_id = workflow_execution_id
         self.tenant_id = tenant_id
-        self.storage_manager = StorageManagerFactory.get_file_manager()
-        self.state_file = os.environ.get("KEEP_STATE_FILE") or self.STATE_FILE
         self.steps_context = {}
         self.steps_context_size = 0
         self.providers_context = {}
-        self.event_context = {}
+        self.actions_context = {}
+        self.event_context: AlertDto = {}
+        self.incident_context = {}
         self.foreach_context = {
             "value": None,
         }
+        self.consts_context = {}
+        self.current_step_vars = {}
+        # cli context
         try:
             self.click_context = click.get_current_context()
         except RuntimeError:
             self.click_context = {}
+        # last workflow context
+        self.last_workflow_execution_results = {}
+        self.last_workflow_run_time = None
+        if self.workflow_id and workflow:
+            try:
+                # @tb: try to understand if the workflow tries to use last_workflow_results
+                # if so, we need to get the last workflow execution and load it into the context
+                workflow_str = json5.dumps(workflow)
+                last_workflow_results_in_workflow = (
+                    "last_workflow_results" in workflow_str
+                )
+                if last_workflow_results_in_workflow:
+                    last_workflow_execution = (
+                        get_last_workflow_execution_by_workflow_id(
+                            tenant_id, workflow_id, status="success"
+                        )
+                    )
+                    if last_workflow_execution is not None:
+                        self.last_workflow_execution_results = (
+                            last_workflow_execution.results
+                        )
+                        self.last_workflow_run_time = last_workflow_execution.started
+            except Exception:
+                self.logger.exception("Failed to get last workflow execution")
+                pass
         self.aliases = {}
-        self.state = {}
         # dependencies are used so iohandler will be able to use the output class of the providers
         # e.g. let's say bigquery_provider results are google.cloud.bigquery.Row
         #     and we want to use it in iohandler, we need to import it before the eval
         self.dependencies = set()
-        if load_state:
-            self.__load_state()
         self.workflow_execution_id = None
         self._api_key = None
+        self.__loggers = {}
+
+    @property
+    def api_url(self):
+        """
+        The URL of the Keep API
+        """
+        return config("KEEP_API_URL")
 
     @property
     def api_key(self):
@@ -56,6 +92,7 @@ class ContextManager:
             session = next(get_session())
             self._api_key = get_or_create_api_key(
                 session=session,
+                created_by="system",
                 tenant_id=self.tenant_id,
                 unique_api_key_id="webhook",
             )
@@ -65,27 +102,44 @@ class ContextManager:
     def set_execution_context(self, workflow_execution_id):
         self.workflow_execution_id = workflow_execution_id
         self.logger_adapter.workflow_execution_id = workflow_execution_id
+        for logger in self.__loggers.values():
+            logger.workflow_execution_id = workflow_execution_id
 
-    def get_logger(self):
-        return self.logger_adapter
+    def get_logger(self, name=None):
+        if not name:
+            return self.logger_adapter
+
+        if name in self.__loggers:
+            return self.__loggers[name]
+
+        logger = logging.getLogger(name)
+        logger_adapter = WorkflowLoggerAdapter(
+            logger,
+            self,
+            self.tenant_id,
+            self.workflow_id,
+            self.workflow_execution_id,
+        )
+        self.__loggers[name] = logger_adapter
+        return logger_adapter
 
     def set_event_context(self, event):
         self.event_context = event
 
+    def set_incident_context(self, incident):
+        self.incident_context = incident
+
+    def set_consts_context(self, consts):
+        self.consts_context = consts
+
     def get_workflow_id(self):
         return self.workflow_id
 
-    def get_full_context(
-        self, exclude_state=False, exclude_providers=False, exclude_env=False
-    ):
+    def get_full_context(self, exclude_providers=False, exclude_env=False):
         """
         Gets full context on the workflows
 
         Usage: context injection used, for example, in iohandler
-
-        Args:
-            exclude_state (bool, optional): for instance when dumping the context to state file, you don't want to dump previous state
-                it's already there. Defaults to False.
 
         Returns:
             dict: dictinoary contains all context about this workflow
@@ -102,17 +156,16 @@ class ContextManager:
             "steps": self.steps_context,
             "foreach": self.foreach_context,
             "event": self.event_context,
+            "last_workflow_results": self.last_workflow_execution_results,
+            "last_workflow_run_time": self.last_workflow_run_time,
             "alert": self.event_context,  # this is an alias so workflows will be able to use alert.source
+            "incident": self.incident_context,  # this is an alias so workflows will be able to use alert.source
+            "consts": self.consts_context,
+            "vars": self.current_step_vars,
         }
 
         if not exclude_providers:
             full_context["providers"] = self.providers_context
-
-        if not exclude_state:
-            full_context["state"] = self.state
-
-        if not exclude_env:
-            full_context["env"] = os.environ
 
         full_context.update(self.aliases)
         return full_context
@@ -170,12 +223,20 @@ class ContextManager:
 
     def set_step_provider_paremeters(self, step_id, provider_parameters):
         if step_id not in self.steps_context:
-            self.steps_context[step_id] = {"provider_parameters": {}, "results": []}
+            self.steps_context[step_id] = {
+                "provider_parameters": {},
+                "results": [],
+                "vars": {},
+            }
         self.steps_context[step_id]["provider_parameters"] = provider_parameters
 
     def set_step_context(self, step_id, results, foreach=False):
         if step_id not in self.steps_context:
-            self.steps_context[step_id] = {"provider_parameters": {}, "results": []}
+            self.steps_context[step_id] = {
+                "provider_parameters": {},
+                "results": [],
+                "vars": {},
+            }
 
         # If this is a foreach step, we need to append the results to the list
         # so we can iterate over them
@@ -187,39 +248,22 @@ class ContextManager:
         self.steps_context["this"] = self.steps_context[step_id]
         self.steps_context_size = asizeof(self.steps_context)
 
-    def __load_state(self):
-        try:
-            self.state = json.loads(
-                self.storage_manager.get_file(
-                    self.tenant_id, self.state_file, create_if_not_exist=True
-                )
-            )
-        except Exception as exc:
-            self.logger.warning("Failed to load state file, using empty state")
-            self.logger.warning(
-                f"State storage: {self.storage_manager.__class__.__name__}"
-            )
-            self.logger.warning(f"Reason: {exc}")
-            self.state = {}
+    def set_step_vars(self, step_id, _vars):
+        if step_id not in self.steps_context:
+            self.steps_context[step_id] = {
+                "provider_parameters": {},
+                "results": [],
+                "vars": {},
+            }
+
+        self.current_step_vars = _vars
+        self.steps_context[step_id]["vars"] = _vars
 
     def get_last_workflow_run(self, workflow_id):
-        if workflow_id in self.state:
-            return self.state[workflow_id][-1]
-        # no previous runs
-        else:
-            return {}
+        return get_last_workflow_execution_by_workflow_id(self.tenant_id, workflow_id)
 
     def dump(self):
-        self.logger.info("Dumping state file")
-        # Write the updated state back to the file
-        try:
-            self.storage_manager.store_file(self.tenant_id, self.state_file, self.state)
-        except Exception as e:
-            self.logger.error(
-                "Failed to dump state file",
-                extra={"exception": e},
-            )
-            # TODO - should we raise an exception here?
+        self.logger.info("Dumping logs to db")
         # dump the workflow logs to the db
         try:
             self.logger_adapter.dump()
@@ -229,27 +273,28 @@ class ContextManager:
                 "Failed to dump workflow logs",
                 extra={"exception": e},
             )
-        self.logger.info("State file dumped")
+        self.logger.info("Logs dumped")
 
     def set_last_workflow_run(self, workflow_id, workflow_context, workflow_status):
-        # TODO - SQLite
-        self.logger.debug(
-            "Adding workflow to state",
-            extra={
-                "workflow_id": workflow_id,
-            },
-        )
-        if workflow_id not in self.state:
-            self.state[workflow_id] = []
-        self.state[workflow_id].append(
-            {
-                "workflow_status": workflow_status,
-                "workflow_context": workflow_context,
-            }
-        )
-        self.logger.debug(
-            "Added workflow to state",
-            extra={
-                "workflow_id": workflow_id,
-            },
-        )
+        # TODO: move to DB
+        # self.logger.debug(
+        #     "Adding workflow to state",
+        #     extra={
+        #         "workflow_id": workflow_id,
+        #     },
+        # )
+        # if workflow_id not in self.state:
+        #     self.state[workflow_id] = []
+        # self.state[workflow_id].append(
+        #     {
+        #         "workflow_status": workflow_status,
+        #         "workflow_context": workflow_context,
+        #     }
+        # )
+        # self.logger.debug(
+        #     "Added workflow to state",
+        #     extra={
+        #         "workflow_id": workflow_id,
+        #     },
+        # )
+        pass

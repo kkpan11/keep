@@ -1,8 +1,10 @@
 """
 SshProvider is a class that provides a way to execute SSH commands and get the output.
 """
+
 import dataclasses
 import io
+import typing
 
 import pydantic
 from paramiko import AutoAddPolicy, RSAKey, SSHClient
@@ -11,50 +13,63 @@ from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig
 from keep.providers.providers_factory import ProvidersFactory
+from keep.validation.fields import NoSchemeUrl, UrlPort
 
 
 @pydantic.dataclasses.dataclass
 class SshProviderAuthConfig:
-    """SSH authentication configuration.
+    """SSH authentication configuration."""
 
-    Raises:
-        ValueError: pkey and password are both empty
-
-    """
-
-    # TODO: validate hostname because it seems pydantic doesn't have a validator for it
-    host: str = dataclasses.field(
-        metadata={"required": True, "description": "SSH hostname"}
+    host: NoSchemeUrl = dataclasses.field(
+        metadata={
+            "required": True,
+            "description": "SSH hostname",
+            "validation": "no_scheme_url",
+        }
     )
     user: str = dataclasses.field(
         metadata={"required": True, "description": "SSH user"}
     )
-    port: int = dataclasses.field(
-        default=22, metadata={"required": False, "description": "SSH port"}
+    port: UrlPort = dataclasses.field(
+        default=22,
+        metadata={"required": False, "description": "SSH port", "validation": "port"},
     )
-    pkey: str = dataclasses.field(
-        default="",
+    pkey: typing.Optional[str] = dataclasses.field(
+        default=None,
         metadata={
-            "required": False,
             "description": "SSH private key",
             "sensitive": True,
+            "type": "file",
+            "name": "pkey",
+            "file_type": "text/plain, application/x-pem-file, application/x-putty-private-key, "
+            + "application/x-ed25519-key, application/pkcs8, application/octet-stream",
+            "config_sub_group": "private_key",
+            "config_main_group": "authentication",
         },
     )
-    password: str = dataclasses.field(
-        default="",
-        metadata={"required": False, "description": "SSH password", "sensitive": True},
+    password: typing.Optional[str] = dataclasses.field(
+        default=None,
+        metadata={
+            "description": "SSH password",
+            "sensitive": True,
+            "config_sub_group": "password",
+            "config_main_group": "authentication",
+        },
     )
 
     @pydantic.root_validator
     def check_password_or_pkey(cls, values):
         password, pkey = values.get("password"), values.get("pkey")
-        if password == "" and pkey == "":
-            raise ValueError("either password or pkey must be provided")
+        if password is None and pkey is None:
+            raise ValueError("either password or private key must be provided")
         return values
 
 
 class SshProvider(BaseProvider):
     """Enrich alerts with data from SSH."""
+
+    PROVIDER_DISPLAY_NAME = "SSH"
+    PROVIDER_CATEGORY = ["Cloud Infrastructure", "Developer Tools"]
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
@@ -90,7 +105,7 @@ class SshProvider(BaseProvider):
             key = RSAKey.from_private_key(
                 private_key_file, self.config.authentication.get("pkey_passphrase")
             )
-            ssh_client.connect(host, port, user, pk=key)
+            ssh_client.connect(host, port, user, pkey=key)
         else:
             # Connect using password
             ssh_client.connect(
@@ -145,20 +160,19 @@ if __name__ == "__main__":
     # Load environment variables
     import os
 
-    user = os.environ.get("SSH_USERNAME")
+    user = os.environ.get("SSH_USERNAME") or "root"
     password = os.environ.get("SSH_PASSWORD")
-    host = os.environ.get("SSH_HOST")
-
+    host = os.environ.get("SSH_HOST") or "1.1.1.1"
+    pkey = os.environ.get("SSH_PRIVATE_KEY")
     config = {
-        "id": "ssh-demo",
         "authentication": {
             "user": user,
-            "password": password,
+            "pkey": pkey,
             "host": host,
         },
     }
     provider = ProvidersFactory.get_provider(
         context_manager, provider_id="ssh", provider_type="ssh", provider_config=config
     )
-    result = provider.query("df -h")
+    result = provider.query(command="df -h")
     print(result)

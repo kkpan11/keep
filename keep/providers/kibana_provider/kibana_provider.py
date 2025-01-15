@@ -1,6 +1,7 @@
 """
 Kibana provider.
 """
+
 import dataclasses
 import datetime
 import json
@@ -12,11 +13,12 @@ import pydantic
 import requests
 from fastapi import HTTPException
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
 from keep.providers.providers_factory import ProvidersFactory
+from keep.validation.fields import UrlPort
 
 
 @pydantic.dataclasses.dataclass
@@ -30,21 +32,28 @@ class KibanaProviderAuthConfig:
             "sensitive": True,
         }
     )
-    kibana_host: str = dataclasses.field(
+    kibana_host: pydantic.AnyHttpUrl = dataclasses.field(
         metadata={
             "required": True,
-            "description": "Kibana Host (e.g. keep.kb.us-central1.gcp.cloud.es.io)",
+            "description": "Kibana Host",
+            "hint": "https://keep.kb.us-central1.gcp.cloud.es.io",
+            "validation": "any_http_url"
         }
     )
-    kibana_port: str = dataclasses.field(
-        metadata={"required": False, "description": "Kibana Port (defaults to 9243)"},
-        default="9243",
+    kibana_port: UrlPort = dataclasses.field(
+        metadata={
+            "required": False,
+            "description": "Kibana Port (defaults to 9243)",
+            "validation": "port"
+        },
+        default=9243,
     )
 
 
 class KibanaProvider(BaseProvider):
     """Enrich alerts with data from Kibana."""
 
+    PROVIDER_CATEGORY = ["Monitoring", "Developer Tools"]
     DEFAULT_TIMEOUT = 10
     WEBHOOK_PAYLOAD = json.dumps(
         {
@@ -130,10 +139,26 @@ class KibanaProvider(BaseProvider):
         ),
     ]
 
+    SEVERITIES_MAP = {}
+
+    STATUS_MAP = {
+        "active": AlertStatus.FIRING,
+        "Alert": AlertStatus.FIRING,
+        "recovered": AlertStatus.RESOLVED,
+    }
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
         super().__init__(context_manager, provider_id, config)
+
+    @staticmethod
+    def parse_event_raw_body(raw_body: bytes | dict) -> dict:
+        # tb: this is a f**king stupid hack because Kibana doesn't escape {{#toJson}} :(
+        if b'"payload": "{' in raw_body:
+            raw_body = raw_body.replace(b'"payload": "{', b'"payload": {')
+            raw_body = raw_body.replace(b'}",', b"},")
+        return json.loads(raw_body)
 
     def validate_scopes(self) -> dict[str, bool | str]:
         """
@@ -195,7 +220,7 @@ class KibanaProvider(BaseProvider):
         headers["Authorization"] = f"ApiKey {self.authentication_config.api_key}"
         headers["kbn-xsrf"] = "reporting"
         response: requests.Response = getattr(requests, method.lower())(
-            f"https://{self.authentication_config.kibana_host}:{self.authentication_config.kibana_port}/{uri}",
+            f"{self.authentication_config.kibana_host}:{self.authentication_config.kibana_port}/{uri}",
             headers=headers,
             **kwargs,
         )
@@ -296,11 +321,15 @@ class KibanaProvider(BaseProvider):
             for status in ["Alert", "Recovered", "No Data"]:
                 alert_actions.append(
                     {
-                        "group": "custom_threshold.fired"
-                        if status == "Alert"
-                        else "recovered"
-                        if status == "Recovered"
-                        else "custom_threshold.nodata",
+                        "group": (
+                            "custom_threshold.fired"
+                            if status == "Alert"
+                            else (
+                                "recovered"
+                                if status == "Recovered"
+                                else "custom_threshold.nodata"
+                            )
+                        ),
                         "id": connector_id,
                         "params": {"body": KibanaProvider.WEBHOOK_PAYLOAD},
                         "frequency": {
@@ -365,7 +394,7 @@ class KibanaProvider(BaseProvider):
                     "params": {},
                     "headers": {},
                     "auth": {"basic": {"username": "keep", "password": api_key}},
-                    "body": '{"payload": {{#toJson}}ctx{{/toJson}}, "status": "Alert"}',
+                    "body": '{"payload": "{{#toJson}}ctx{{/toJson}}", "status": "Alert"}',
                 }
             }
             self.request(
@@ -413,6 +442,12 @@ class KibanaProvider(BaseProvider):
         self.logger.info("Done setting up webhooks")
 
     def validate_config(self):
+        if self.is_installed or self.is_provisioned:
+            host = self.config.authentication['kibana_host']
+            if not (host.startswith("http://") or host.startswith("https://")):
+                scheme = "http://" if ("localhost" in host or "127.0.0.1" in host) else "https://"
+                self.config.authentication['kibana_host'] = scheme + host
+
         self.authentication_config = KibanaProviderAuthConfig(
             **self.config.authentication
         )
@@ -423,26 +458,36 @@ class KibanaProvider(BaseProvider):
 
     @staticmethod
     def format_alert_from_watcher(event: dict) -> AlertDto | list[AlertDto]:
-        alert_id = event.get("payload", {}).pop("id")
-        alert_name = event.get("payload", {}).get("metadata", {}).get("name")
-        last_received = (
-            event.get("payload", {})
-            .get("trigger", {})
-            .get("triggered_time", datetime.datetime.now().isoformat())
+        payload = event.get("payload", {})
+        alert_id = payload.pop("id")
+        alert_metadata = payload.get("metadata", {})
+        alert_name = alert_metadata.get("name") if alert_metadata else alert_id
+        last_received = payload.get("trigger", {}).get(
+            "triggered_time",
+            datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
         )
-        status = event.pop("status", "Alert")
+        # map status to keep status
+        status = KibanaProvider.STATUS_MAP.get(
+            event.pop("status", None), AlertStatus.FIRING
+        )
+        # kibana watcher doesn't have severity, so we'll use default (INFO)
+        severity = AlertSeverity.INFO
+
         return AlertDto(
             id=alert_id,
             name=alert_name,
-            fingerprint=event.get("payload", {}).get("watch_id", alert_id),
+            fingerprint=payload.get("watch_id", alert_id),
             status=status,
+            severity=severity,
             lastReceived=last_received,
             source=["kibana"],
             **event,
         )
 
     @staticmethod
-    def format_alert(event: dict) -> AlertDto | list[AlertDto]:
+    def _format_alert(
+        event: dict, provider_instance: "BaseProvider" = None
+    ) -> AlertDto | list[AlertDto]:
         """
         Formats an alert from Kibana to a standard format.
 
@@ -456,18 +501,35 @@ class KibanaProvider(BaseProvider):
         # If this is coming from Kibana Watcher
         if "payload" in event:
             return KibanaProvider.format_alert_from_watcher(event)
-
-        labels = {
-            v.split("=", 1)[0]: v.split("=", 1)[1]
-            for v in event.get("ruleTags", "").split(",")
-        }
-        labels.update(
-            {
+        try:
+            labels = {
                 v.split("=", 1)[0]: v.split("=", 1)[1]
-                for v in event.get("contextTags", "").split(",")
+                for v in event.get("ruleTags", "").split(",")
             }
-        )
+        except Exception:
+            # Failed to extract labels from ruleTags
+            labels = {}
+
+        try:
+            labels.update(
+                {
+                    v.split("=", 1)[0]: v.split("=", 1)[1]
+                    for v in event.get("contextTags", "").split(",")
+                }
+            )
+        except Exception:
+            # Failed to enrich labels with contextTags
+            pass
+
         environment = labels.get("environment", "undefined")
+
+        # format status and severity to Keep format
+        event["status"] = KibanaProvider.STATUS_MAP.get(
+            event.get("status"), AlertStatus.FIRING
+        )
+        event["severity"] = KibanaProvider.SEVERITIES_MAP.get(
+            event.get("severity"), AlertSeverity.INFO
+        )
         return AlertDto(
             environment=environment, labels=labels, source=["kibana"], **event
         )

@@ -4,7 +4,7 @@ import os
 
 import kubernetes.client
 import kubernetes.config
-from kubernetes.client.rest import ApiException
+from kubernetes.client.exceptions import ApiException
 
 from keep.secretmanager.secretmanager import BaseSecretManager
 
@@ -32,20 +32,36 @@ class KubernetesSecretManager(BaseSecretManager):
             ApiException: If an error occurs while writing the secret.
         """
         # k8s requirements: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-        secret_name = secret_name.replace("_", "-")
+        secret_name = secret_name.replace("_", "-").lower()
         self.logger.info("Writing secret", extra={"secret_name": secret_name})
 
+        body = kubernetes.client.V1Secret(
+            metadata=kubernetes.client.V1ObjectMeta(name=secret_name),
+            data={"value": base64.b64encode(secret_value.encode()).decode()},
+        )
         try:
-            body = kubernetes.client.V1Secret(
-                metadata=kubernetes.client.V1ObjectMeta(name=secret_name),
-                data={"value": base64.b64encode(secret_value.encode()).decode()},
-            )
             self.api.create_namespaced_secret(namespace=self.namespace, body=body)
             self.logger.info(
                 "Secret created/updated successfully",
                 extra={"secret_name": secret_name},
             )
         except ApiException as e:
+            if e.status == 409:
+                # Secret exists, try to patch it
+                try:
+                    self.api.patch_namespaced_secret(
+                        name=secret_name, namespace=self.namespace, body=body
+                    )
+                    self.logger.info(
+                        "Secret updated successfully",
+                        extra={"secret_name": secret_name},
+                    )
+                except kubernetes.client.exceptions.ApiException as patch_error:
+                    self.logger.error(
+                        "Error updating secret",
+                        extra={"secret_name": secret_name, "error": str(patch_error)},
+                    )
+                    raise patch_error
             self.logger.error(
                 "Error writing secret",
                 extra={"secret_name": secret_name, "error": str(e)},
@@ -54,7 +70,7 @@ class KubernetesSecretManager(BaseSecretManager):
 
     def read_secret(self, secret_name: str, is_json: bool = False) -> str | dict:
         # k8s requirements: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-        secret_name = secret_name.replace("_", "-")
+        secret_name = secret_name.replace("_", "-").lower()
         self.logger.info("Getting secret", extra={"secret_name": secret_name})
         try:
             response = self.api.read_namespaced_secret(
@@ -74,32 +90,8 @@ class KubernetesSecretManager(BaseSecretManager):
             )
             raise
 
-    def list_secrets(self, prefix: str) -> list:
-        """
-        List all secrets in the Kubernetes Secret with the given prefix.
-
-        Args:
-            prefix (str): The prefix to filter secrets by.
-
-        Returns:
-            list: A list of secret names.
-        """
-        self.logger.info("Listing secrets", extra={"prefix": prefix})
-        try:
-            secrets = self.api.list_namespaced_secret(namespace=self.namespace)
-            secret_names = [secret.metadata.name for secret in secrets.items]
-            filtered_secrets = [
-                name for name in secret_names if name.startswith(prefix)
-            ]
-            self.logger.info("Listed secrets successfully", extra={"prefix": prefix})
-            return filtered_secrets
-        except ApiException as e:
-            self.logger.error(
-                "Error listing secrets", extra={"prefix": prefix, "error": str(e)}
-            )
-            raise
-
     def delete_secret(self, secret_name: str) -> None:
+        secret_name = secret_name.replace("_", "-").lower()
         self.logger.info("Deleting secret", extra={"secret_name": secret_name})
         try:
             self.api.delete_namespaced_secret(

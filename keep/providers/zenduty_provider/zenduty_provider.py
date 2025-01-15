@@ -21,6 +21,9 @@ class ZendutyProviderAuthConfig:
 class ZendutyProvider(BaseProvider):
     """Create incident in Zenduty."""
 
+    PROVIDER_DISPLAY_NAME = "Zenduty"
+    PROVIDER_CATEGORY = ["Incident Management"]
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -37,7 +40,15 @@ class ZendutyProvider(BaseProvider):
         """
         pass
 
-    def _notify(self, **kwargs: dict):
+    def _notify(
+        self,
+        title: str = "",
+        summary: str = "",
+        service: str = "",
+        user: str = "",
+        policy: str = "",
+        **kwargs: dict
+    ):
         """
         Create incident Zenduty using the Zenduty API
 
@@ -47,11 +58,6 @@ class ZendutyProvider(BaseProvider):
             kwargs (dict): The providers with context
         """
         self.logger.debug("Notifying incident to Zenduty")
-        title = kwargs.pop("title", "")
-        summary = kwargs.pop("summary", "")
-        user = kwargs.pop("user", None)
-        service = kwargs.pop("service", "")
-        policy = kwargs.pop("policy", "")
 
         if not service:
             raise ProviderException("Service is required")

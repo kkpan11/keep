@@ -4,12 +4,18 @@ import re
 import typing
 import uuid
 
-from keep.api.core.config import AuthenticationType
-from keep.api.core.db import get_enrichment, save_workflow_results
-from keep.api.models.alert import AlertDto
+from keep.api.core.config import config
+from keep.api.core.db import (
+    get_enrichment,
+    get_previous_alert_by_fingerprint,
+    save_workflow_results,
+)
+from keep.api.core.metrics import workflow_execution_duration
+from keep.api.models.alert import AlertDto, AlertSeverity, IncidentDto
+from keep.identitymanager.identitymanagerfactory import IdentityManagerTypes
 from keep.providers.providers_factory import ProviderConfigurationException
 from keep.workflowmanager.workflow import Workflow
-from keep.workflowmanager.workflowscheduler import WorkflowScheduler
+from keep.workflowmanager.workflowscheduler import WorkflowScheduler, timing_histogram
 from keep.workflowmanager.workflowstore import WorkflowStore
 
 
@@ -25,6 +31,10 @@ class WorkflowManager:
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self.debug = config("WORKFLOW_MANAGER_DEBUG", default=False, cast=bool)
+        if self.debug:
+            self.logger.setLevel(logging.DEBUG)
+
         self.scheduler = WorkflowScheduler(self)
         self.workflow_store = WorkflowStore()
         self.started = False
@@ -34,17 +44,22 @@ class WorkflowManager:
         if self.started:
             self.logger.info("Workflow manager already started")
             return
+
         await self.scheduler.start()
         self.started = True
 
     def stop(self):
         """Stops the workflow manager"""
+        if not self.started:
+            return
         self.scheduler.stop()
         self.started = False
+        # Clear the scheduler reference
+        self.scheduler = None
 
     def _apply_filter(self, filter_val, value):
-        # if its a regex, apply it
-        if filter_val.startswith('r"'):
+        # if it's a regex, apply it
+        if isinstance(filter_val, str) and filter_val.startswith('r"'):
             try:
                 # remove the r" and the last "
                 pattern = re.compile(filter_val[2:-1])
@@ -56,59 +71,166 @@ class WorkflowManager:
                 )
                 return False
         else:
+            # For cases like `dismissed`
+            if isinstance(filter_val, bool) and isinstance(value, str):
+                return value == str(filter_val)
             return value == filter_val
 
-    def insert_events(self, tenant_id, events: typing.List[AlertDto]):
+    def _get_workflow_from_store(self, tenant_id, workflow_model):
+        try:
+            # get the actual workflow that can be triggered
+            self.logger.info("Getting workflow from store")
+            workflow = self.workflow_store.get_workflow(tenant_id, workflow_model.id)
+            self.logger.info("Got workflow from store")
+            return workflow
+        except ProviderConfigurationException:
+            self.logger.exception(
+                "Workflow have a provider that is not configured",
+                extra={
+                    "workflow_id": workflow_model.id,
+                    "tenant_id": tenant_id,
+                },
+            )
+        except Exception:
+            self.logger.exception(
+                "Error getting workflow",
+                extra={
+                    "workflow_id": workflow_model.id,
+                    "tenant_id": tenant_id,
+                },
+            )
+
+    def insert_incident(self, tenant_id: str, incident: IncidentDto, trigger: str):
+        all_workflow_models = self.workflow_store.get_all_workflows(tenant_id)
+        self.logger.info(
+            "Got all workflows",
+            extra={
+                "num_of_workflows": len(all_workflow_models),
+            },
+        )
+        for workflow_model in all_workflow_models:
+
+            if workflow_model.is_disabled:
+                self.logger.debug(
+                    f"Skipping the workflow: id={workflow_model.id}, name={workflow_model.name}, "
+                    f"tenant_id={workflow_model.tenant_id} - Workflow is disabled."
+                )
+                continue
+            workflow = self._get_workflow_from_store(tenant_id, workflow_model)
+            if workflow is None:
+                continue
+
+            # Using list comprehension instead of pandas flatten() for better performance
+            # and to avoid pandas dependency
+            # @tb: I removed pandas so if we'll have performance issues we can revert to pandas
+            incident_triggers = [
+                event
+                for trigger in workflow.workflow_triggers
+                if trigger["type"] == "incident"
+                for event in trigger.get("events", [])
+            ]
+
+            if trigger not in incident_triggers:
+                self.logger.debug(
+                    "workflow does not contain trigger %s, skipping", trigger
+                )
+                continue
+
+            self.logger.info("Adding workflow to run")
+            with self.scheduler.lock:
+                self.scheduler.workflows_to_run.append(
+                    {
+                        "workflow": workflow,
+                        "workflow_id": workflow_model.id,
+                        "tenant_id": tenant_id,
+                        "triggered_by": "incident:{}".format(trigger),
+                        "event": incident,
+                    }
+                )
+            self.logger.info("Workflow added to run")
+
+    def insert_events(self, tenant_id, events: typing.List[AlertDto | IncidentDto]):
         for event in events:
+            self.logger.info("Getting all workflows")
             all_workflow_models = self.workflow_store.get_all_workflows(tenant_id)
+            self.logger.info(
+                "Got all workflows",
+                extra={
+                    "num_of_workflows": len(all_workflow_models),
+                },
+            )
             for workflow_model in all_workflow_models:
-                try:
-                    # get the actual workflow that can be triggered
-                    workflow = self.workflow_store.get_workflow(
-                        tenant_id, workflow_model.id
-                    )
-                # the provider is not configured, hence the workflow cannot be triggered
-                # todo - handle it better
-                # todo2 - handle if more than one provider is not configured
-                except ProviderConfigurationException as e:
-                    self.logger.warn(
-                        f"Workflow have a provider that is not configured: {e}"
+
+                if workflow_model.is_disabled:
+                    self.logger.debug(
+                        f"Skipping the workflow: id={workflow_model.id}, name={workflow_model.name}, "
+                        f"tenant_id={workflow_model.tenant_id} - Workflow is disabled."
                     )
                     continue
-                except Exception as e:
-                    # TODO: how to handle workflows that aren't properly parsed/configured?
-                    self.logger.error(f"Error getting workflow: {e}")
+                workflow = self._get_workflow_from_store(tenant_id, workflow_model)
+                if workflow is None:
                     continue
+
                 for trigger in workflow.workflow_triggers:
                     # TODO: handle it better
                     if not trigger.get("type") == "alert":
+                        self.logger.debug("trigger type is not alert, skipping")
                         continue
                     should_run = True
+                    # apply filters
                     for filter in trigger.get("filters", []):
                         # TODO: more sophisticated filtering/attributes/nested, etc
+                        self.logger.debug(f"Running filter {filter}")
                         filter_key = filter.get("key")
                         filter_val = filter.get("value")
-                        if not getattr(event, filter_key, None):
+                        event_val = self._get_event_value(event, filter_key)
+                        self.logger.debug(
+                            "Filtering",
+                            extra={
+                                "filter_key": filter_key,
+                                "filter_val": filter_val,
+                                "event": event,
+                            },
+                        )
+                        if event_val is None:
                             self.logger.warning(
-                                "Failed to run filter, skipping the event. Probably misconfigured workflow."
+                                "Failed to run filter, skipping the event. Probably misconfigured workflow.",
+                                extra={
+                                    "tenant_id": tenant_id,
+                                    "filter_key": filter_key,
+                                    "filter_val": filter_val,
+                                    "workflow_id": workflow_model.id,
+                                },
                             )
+                            should_run = False
                             continue
                         # if its list, check if the filter is in the list
-                        if isinstance(getattr(event, filter_key), list):
-                            for val in getattr(event, filter_key):
+                        if isinstance(event_val, list):
+                            for val in event_val:
                                 # if one filter applies, it should run
                                 if self._apply_filter(filter_val, val):
+                                    self.logger.debug(
+                                        "Filter matched, running",
+                                        extra={
+                                            "filter_key": filter_key,
+                                            "filter_val": filter_val,
+                                            "event": event,
+                                        },
+                                    )
                                     should_run = True
                                     break
+                                self.logger.debug(
+                                    "Filter didn't match, skipping",
+                                    extra={
+                                        "filter_key": filter_key,
+                                        "filter_val": filter_val,
+                                        "event": event,
+                                    },
+                                )
                                 should_run = False
                         # elif the filter is string/int/float, compare them:
-                        elif type(getattr(event, filter_key, None)) in [
-                            int,
-                            str,
-                            float,
-                        ]:
-                            val = getattr(event, filter_key)
-                            if not self._apply_filter(filter_val, val):
+                        elif type(event_val) in [int, str, float, bool]:
+                            if not self._apply_filter(filter_val, event_val):
                                 self.logger.debug(
                                     "Filter didn't match, skipping",
                                     extra={
@@ -127,17 +249,68 @@ class WorkflowManager:
                             should_run = False
                             break
 
-                    # if we got here, it means the event should trigger the workflow
-                    if should_run:
-                        self.logger.info("Found a workflow to run")
-                        event.trigger = "alert"
-                        # prepare the alert with the enrichment
-                        self.logger.info("Enriching alert")
-                        alert_enrichment = get_enrichment(tenant_id, event.fingerprint)
-                        if alert_enrichment:
-                            for k, v in alert_enrichment.enrichments.items():
-                                setattr(event, k, v)
-                        self.logger.info("Alert enriched")
+                    if not should_run:
+                        self.logger.debug("Skipping the workflow")
+                        continue
+                    # enrich the alert with more data
+                    self.logger.info("Found a workflow to run")
+                    event.trigger = "alert"
+                    # prepare the alert with the enrichment
+                    self.logger.info("Enriching alert")
+                    alert_enrichment = get_enrichment(tenant_id, event.fingerprint)
+                    if alert_enrichment:
+                        for k, v in alert_enrichment.enrichments.items():
+                            setattr(event, k, v)
+                    self.logger.info("Alert enriched")
+                    # apply only_on_change (https://github.com/keephq/keep/issues/801)
+                    fields_that_needs_to_be_change = trigger.get("only_on_change", [])
+                    severity_changed = trigger.get("severity_changed", False)
+                    # if there are fields that needs to be changed, get the previous alert
+                    if fields_that_needs_to_be_change or severity_changed:
+                        previous_alert = get_previous_alert_by_fingerprint(
+                            tenant_id, event.fingerprint
+                        )
+                        if severity_changed:
+                            fields_that_needs_to_be_change.append("severity")
+                        # now compare:
+                        #   (no previous alert means that the workflow should run)
+                        if previous_alert:
+                            for field in fields_that_needs_to_be_change:
+                                # the field hasn't change
+                                if getattr(event, field) == previous_alert.event.get(
+                                    field
+                                ):
+                                    self.logger.info(
+                                        "Skipping the workflow because the field hasn't change",
+                                        extra={
+                                            "field": field,
+                                            "event": event,
+                                            "previous_alert": previous_alert,
+                                        },
+                                    )
+                                    should_run = False
+                                    break
+                            if should_run and severity_changed:
+                                setattr(event, "severity_changed", True)
+                                setattr(
+                                    event,
+                                    "previous_severity",
+                                    previous_alert.event.get("severity"),
+                                )
+                                previous_severity = AlertSeverity(
+                                    previous_alert.event.get("severity")
+                                )
+                                current_severity = AlertSeverity(event.severity)
+                                if previous_severity < current_severity:
+                                    setattr(event, "severity_change", "increased")
+                                else:
+                                    setattr(event, "severity_change", "decreased")
+
+                    if not should_run:
+                        continue
+                    # Lastly, if the workflow should run, add it to the scheduler
+                    self.logger.info("Adding workflow to run")
+                    with self.scheduler.lock:
                         self.scheduler.workflows_to_run.append(
                             {
                                 "workflow": workflow,
@@ -147,37 +320,25 @@ class WorkflowManager:
                                 "event": event,
                             }
                         )
+                    self.logger.info("Workflow added to run")
 
-    # TODO should be fixed to support the usual CLI
-    def run(self, workflows: list[Workflow]):
-        """
-        Run list of workflows.
-
-        Args:
-            workflow (str): Either an workflow yaml or a directory containing workflow yamls or a list of URLs to get the workflows from.
-            providers_file (str, optional): The path to the providers yaml. Defaults to None.
-        """
-        self.logger.info("Running workflow(s)")
-        workflows_errors = []
-        # If at least one workflow has an interval, run workflows using the scheduler,
-        #   otherwise, just run it
-        if any([Workflow.workflow_interval for Workflow in workflows]):
-            # running workglows in scheduler mode
-            self.logger.info(
-                "Found at least one workflow with an interval, running in scheduler mode"
-            )
-            self.scheduler_mode = True
-            # if the workflows doesn't have an interval, set the default interval
-            for workflow in workflows:
-                workflow.workflow_interval = workflow.workflow_interval
-            # This will halt until KeyboardInterrupt
-            self.scheduler.run_workflows(workflows)
-            self.logger.info("Workflow(s) scheduled")
+    def _get_event_value(self, event, filter_key):
+        # if the filter key is a nested key, get the value
+        if "." in filter_key:
+            filter_key_split = filter_key.split(".")
+            # event is alert dto so we need getattr
+            event_val = getattr(event, filter_key_split[0], None)
+            if not event_val:
+                return None
+            # iterate the other keys
+            for key in filter_key_split[1:]:
+                event_val = event_val.get(key, None)
+                # if the key doesn't exist, return None because we didn't find the value
+                if not event_val:
+                    return None
+            return event_val
         else:
-            # running workflows in the regular mode
-            workflows_errors = self._run_workflows_from_cli(workflows)
-
-        return workflows_errors
+            return getattr(event, filter_key, None)
 
     def _check_premium_providers(self, workflow: Workflow):
         """
@@ -189,49 +350,117 @@ class WorkflowManager:
         Raises:
             Exception: If the workflow uses premium providers in multi tenant mode.
         """
-        if (
-            os.environ.get("AUTH_TYPE", AuthenticationType.NO_AUTH.value)
-            == AuthenticationType.MULTI_TENANT.value
-        ):
+        if os.environ.get("AUTH_TYPE", IdentityManagerTypes.NOAUTH.value) in (
+            IdentityManagerTypes.AUTH0.value,
+            "MULTI_TENANT",
+        ):  # backward compatibility
             for provider in workflow.workflow_providers_type:
                 if provider in self.PREMIUM_PROVIDERS:
                     raise Exception(
                         f"Provider {provider} is a premium provider. You can self-host or contact us to get access to it."
                     )
 
-    def _run_workflow(self, workflow: Workflow, workflow_execution_id: str):
-        self.logger.info(f"Running workflow {workflow.workflow_id}")
+    def _run_workflow_on_failure(
+        self, workflow: Workflow, workflow_execution_id: str, error_message: str
+    ):
+        """
+        Runs the workflow on_failure action.
+
+        Args:
+            workflow (Workflow): The workflow that fails
+            workflow_execution_id (str): Workflow execution id
+            error_message (str): The error message(s)
+        """
+        if workflow.on_failure:
+            self.logger.info(
+                f"Running on_failure action for workflow {workflow.workflow_id}",
+                extra={
+                    "workflow_execution_id": workflow_execution_id,
+                    "workflow_id": workflow.workflow_id,
+                    "tenant_id": workflow.context_manager.tenant_id,
+                },
+            )
+            # Adding the exception message to the provider context, so it'll be available for the action
+            message = (
+                f"Workflow {workflow.workflow_id} failed with errors: {error_message}"
+            )
+            workflow.on_failure.provider_parameters = {"message": message}
+            workflow.on_failure.run()
+            self.logger.info(
+                "Ran on_failure action for workflow",
+                extra={
+                    "workflow_execution_id": workflow_execution_id,
+                    "workflow_id": workflow.workflow_id,
+                    "tenant_id": workflow.context_manager.tenant_id,
+                },
+            )
+        else:
+            self.logger.debug(
+                "No on_failure configured for workflow",
+                extra={
+                    "workflow_execution_id": workflow_execution_id,
+                    "workflow_id": workflow.workflow_id,
+                    "tenant_id": workflow.context_manager.tenant_id,
+                },
+            )
+
+    @timing_histogram(workflow_execution_duration)
+    def _run_workflow(
+        self, workflow: Workflow, workflow_execution_id: str, test_run=False
+    ):
+        self.logger.debug(f"Running workflow {workflow.workflow_id}")
         errors = []
+        results = {}
         try:
             self._check_premium_providers(workflow)
             errors = workflow.run(workflow_execution_id)
+            if errors:
+                self._run_workflow_on_failure(
+                    workflow, workflow_execution_id, ", ".join(errors)
+                )
         except Exception as e:
             self.logger.error(
                 f"Error running workflow {workflow.workflow_id}",
                 extra={"exception": e, "workflow_execution_id": workflow_execution_id},
             )
-            if workflow.on_failure:
-                self.logger.info(
-                    f"Running on_failure action for workflow {workflow.workflow_id}"
-                )
-                # Adding the exception message to the provider context so it'll be available for the action
-                message = (
-                    f"Workflow {workflow.workflow_id} failed with exception: {str(e)}å"
-                )
-                workflow.on_failure.provider_parameters = {"message": message}
-                workflow.on_failure.run()
+            self._run_workflow_on_failure(workflow, workflow_execution_id, str(e))
             raise
         finally:
-            # todo - state should be saved in db
-            workflow.context_manager.dump()
+            if not test_run:
+                workflow.context_manager.dump()
 
-        self._save_workflow_results(workflow, workflow_execution_id)
         if any(errors):
             self.logger.info(msg=f"Workflow {workflow.workflow_id} ran with errors")
         else:
             self.logger.info(f"Workflow {workflow.workflow_id} ran successfully")
 
-        return errors
+        if test_run:
+            results = self._get_workflow_results(workflow)
+        else:
+            self._save_workflow_results(workflow, workflow_execution_id)
+
+        return [errors, results]
+
+    @staticmethod
+    def _get_workflow_results(workflow: Workflow):
+        """
+        Get the results of the workflow from the DB.
+
+        Args:
+            workflow (Workflow): The workflow to get the results for.
+
+        Returns:
+            dict: The results of the workflow.
+        """
+
+        workflow_results = {
+            action.name: action.provider.results for action in workflow.workflow_actions
+        }
+        if workflow.workflow_steps:
+            workflow_results.update(
+                {step.name: step.provider.results for step in workflow.workflow_steps}
+            )
+        return workflow_results
 
     def _save_workflow_results(self, workflow: Workflow, workflow_execution_id: str):
         """
@@ -245,6 +474,10 @@ class WorkflowManager:
         workflow_results = {
             action.name: action.provider.results for action in workflow.workflow_actions
         }
+        if workflow.workflow_steps:
+            workflow_results.update(
+                {step.name: step.provider.results for step in workflow.workflow_steps}
+            )
         try:
             save_workflow_results(
                 tenant_id=workflow.context_manager.tenant_id,
@@ -264,7 +497,7 @@ class WorkflowManager:
         for workflow in workflows:
             try:
                 random_workflow_id = str(uuid.uuid4())
-                errors = self._run_workflow(
+                errors, _ = self._run_workflow(
                     workflow, workflow_execution_id=random_workflow_id
                 )
                 workflows_errors.append(errors)

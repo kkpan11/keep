@@ -7,7 +7,8 @@ from opsgenie_sdk.rest import ApiException
 
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
-from keep.providers.models.provider_config import ProviderConfig
+from keep.providers.models.provider_config import ProviderConfig, ProviderScope
+from keep.providers.models.provider_method import ProviderMethod
 
 
 @pydantic.dataclasses.dataclass
@@ -15,7 +16,8 @@ class OpsgenieProviderAuthConfig:
     api_key: str = dataclasses.field(
         metadata={
             "required": True,
-            "description": "Ops genie api key (https://support.atlassian.com/opsgenie/docs/api-key-management/)",
+            "description": "Ops genie api key",
+            "hint": "https://support.atlassian.com/opsgenie/docs/api-key-management/",
             "sensitive": True,
         },
     )
@@ -30,17 +32,82 @@ class OpsGenieRecipient(pydantic.BaseModel):
 class OpsgenieProvider(BaseProvider):
     """Create incidents in OpsGenie."""
 
+    PROVIDER_DISPLAY_NAME = "OpsGenie"
+    PROVIDER_CATEGORY = ["Incident Management"]
+
+    PROVIDER_SCOPES = [
+        ProviderScope(
+            name="opsgenie:create",
+            description="Create OpsGenie alerts",
+            mandatory=True,
+            alias="Create alerts",
+        ),
+    ]
+
+    PROVIDER_METHODS = [
+        ProviderMethod(
+            name="Close an alert",
+            func_name="close_alert",
+            scopes=["opsgenie:create"],
+            description="Close an alert",
+            type="action",
+        ),
+        ProviderMethod(
+            name="Comment an alert",
+            func_name="comment_alert",
+            scopes=["opsgenie:create"],
+            description="Comment an alert",
+            type="action",
+        ),
+    ]
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
         super().__init__(context_manager, provider_id, config)
         self.configuration = opsgenie_sdk.Configuration()
+        self.configuration.retry_http_response = ["429", "500", "502-599", "404"]
+        self.configuration.short_polling_max_retries = 3
         self.configuration.api_key["Authorization"] = self.authentication_config.api_key
+
+    def validate_scopes(self):
+        scopes = {}
+        self.logger.info("Validating scopes")
+        try:
+            alert = self._create_alert(
+                user="John Doe",
+                note="Simple alert",
+                message="Simple alert showing context with name: John Doe",
+            )
+            deleted = self._delete_alert(alert.get("alert_id"))
+            if not deleted:
+                self.logger.warning(
+                    "Failed to delete OpsGenie alert in scope validation"
+                )
+            scopes["opsgenie:create"] = True
+        except ApiException as e:
+            self.logger.exception("Failed to create OpsGenie alert")
+            scopes["opsgenie:create"] = str(e)
+        except Exception as e:
+            self.logger.exception("Failed to create OpsGenie alert")
+            scopes["opsgenie:create"] = str(e)
+        return scopes
 
     def validate_config(self):
         self.authentication_config = OpsgenieProviderAuthConfig(
             **self.config.authentication
         )
+
+    def _delete_alert(self, alert_id: str) -> bool:
+        api_instance = opsgenie_sdk.AlertApi(opsgenie_sdk.ApiClient(self.configuration))
+        request = api_instance.delete_alert(alert_id)
+        response = request.retrieve_result()
+        if not response.data.is_success:
+            self.logger.error(
+                "Failed to delete OpsGenie alert",
+                extra={"alert_id": alert_id, "response": response.data.to_dict()},
+            )
+        return response.data.is_success
 
     # https://github.com/opsgenie/opsgenie-python-sdk/blob/master/docs/CreateAlertPayload.md
     def _create_alert(
@@ -80,9 +147,56 @@ class OpsgenieProvider(BaseProvider):
             priority=priority,
         )
         try:
-            api_instance.create_alert(create_alert_payload)
+            alert = api_instance.create_alert(create_alert_payload)
+            response = alert.retrieve_result()
+            if not response.data.is_success:
+                raise Exception(
+                    f"Failed to create OpsGenie alert: {response.data.status}"
+                )
+            return response.data.to_dict()
         except ApiException:
             self.logger.exception("Failed to create OpsGenie alert")
+            raise
+
+    # https://github.com/opsgenie/opsgenie-python-sdk/blob/master/docs/CloseAlertPayload.md
+    def close_alert(
+        self,
+        alert_id: str,
+    ):
+        """
+        Close OpsGenie Alert.
+
+        """
+        self.logger.info("Closing Opsgenie alert", extra={"alert_id": alert_id})
+        api_instance = opsgenie_sdk.AlertApi(opsgenie_sdk.ApiClient(self.configuration))
+        close_alert_payload = opsgenie_sdk.CloseAlertPayload()
+        try:
+            api_instance.close_alert(alert_id, close_alert_payload=close_alert_payload)
+            self.logger.info("Opsgenie Alert Closed", extra={"alert_id": alert_id})
+        except ApiException:
+            self.logger.exception("Failed to close OpsGenie alert")
+            raise
+
+    # https://github.com/opsgenie/opsgenie-python-sdk/blob/master/docs/AddNoteToAlertPayload.md
+    def comment_alert(
+        self,
+        alert_id: str,
+        note: str,
+    ):
+        """
+        Add comment or note to an OpsGenie Alert.
+
+        """
+        self.logger.info("Commenting Opsgenie alert", extra={"alert_id": alert_id})
+        api_instance = opsgenie_sdk.AlertApi(opsgenie_sdk.ApiClient(self.configuration))
+        add_note_to_alert_payload = opsgenie_sdk.AddNoteToAlertPayload(
+            note=note,
+        )
+        try:
+            api_instance.add_note(alert_id, add_note_to_alert_payload)
+            self.logger.info("Opsgenie Alert Commented", extra={"alert_id": alert_id})
+        except ApiException:
+            self.logger.exception("Failed to comment OpsGenie alert")
             raise
 
     def dispose(self):
@@ -91,7 +205,7 @@ class OpsgenieProvider(BaseProvider):
         """
         pass
 
-    def notify(
+    def _notify(
         self,
         user: str | None = None,
         note: str | None = None,
@@ -116,7 +230,7 @@ class OpsgenieProvider(BaseProvider):
         Args:
             kwargs (dict): The providers with context
         """
-        self._create_alert(
+        return self._create_alert(
             user,
             note,
             source,
@@ -142,7 +256,7 @@ class OpsgenieProvider(BaseProvider):
 
         return {
             "alerts": alerts.data,
-            "number_of_alerts": len(alerts.data),
+            "alerts_count": len(alerts.data),
         }
 
 

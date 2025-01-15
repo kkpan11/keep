@@ -13,17 +13,21 @@ from keep.providers.models.provider_config import ProviderConfig
 class MattermostProviderAuthConfig:
     """Mattermost authentication configuration."""
 
-    webhook_url: str = dataclasses.field(
+    webhook_url: pydantic.AnyHttpUrl = dataclasses.field(
         metadata={
             "required": True,
             "description": "Mattermost Webhook Url",
             "sensitive": True,
+            "validation": "any_http_url",
         }
     )
 
 
 class MattermostProvider(BaseProvider):
     """send alert message to Mattermost."""
+
+    PROVIDER_DISPLAY_NAME = "Mattermost"
+    PROVIDER_CATEGORY = ["Collaboration"]
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
@@ -34,8 +38,6 @@ class MattermostProvider(BaseProvider):
         self.authentication_config = MattermostProviderAuthConfig(
             **self.config.authentication
         )
-        if not self.authentication_config.webhook_url:
-            raise Exception("Mattermost webhook URL is required")
 
     def dispose(self):
         """
@@ -51,22 +53,25 @@ class MattermostProvider(BaseProvider):
         Args:
             kwargs (dict): The providers with context
         """
-        self.logger.debug("Notifying alert message to Mattermost")
+        self.logger.info("Notifying alert message to Mattermost")
         if not message:
             message = blocks[0].get("text")
         webhook_url = self.authentication_config.webhook_url
         payload = {"text": message, "blocks": blocks}
-        if channel:
-            payload["channel"] = channel
+        # channel is currently bugged (and unnecessary, as a webhook url is already one per channel) and so it is ignored for now
+        # if channel:
+        #    payload["channel"] = channel
 
-        response = requests.post(webhook_url, json=payload)
+        response = requests.post(webhook_url, json=payload, verify=False)
 
         if not response.ok:
             raise ProviderException(
                 f"{self.__class__.__name__} failed to notify alert message to Mattermost: {response.text}"
             )
 
-        self.logger.debug("Alert message notified to Mattermost")
+        self.logger.info(
+            "Alert message notified to Mattermost", extra={"response": response.text}
+        )
 
 
 if __name__ == "__main__":

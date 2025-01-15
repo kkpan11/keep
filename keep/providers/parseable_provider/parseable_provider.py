@@ -1,16 +1,16 @@
 """
 Parseable Provider is a class that allows to ingest/digest data from Parseable.
 """
+
 import dataclasses
 import datetime
-import json
 import logging
 import os
 from uuid import uuid4
 
 import pydantic
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig
@@ -50,6 +50,7 @@ class ParseableProviderAuthConfig:
 class ParseableProvider(BaseProvider):
     """Parseable provider to ingest data from Parseable."""
 
+    PROVIDER_CATEGORY = ["Monitoring"]
     webhook_description = "This is an example of how to configure an alert to be sent to Keep using Parseable's webhook feature. Post this to https://YOUR_PARSEABLE_SERVER/api/v1/logstream/YOUR_STREAM_NAME/alert"
     webhook_template = """{{
     "version": "v1",
@@ -82,6 +83,21 @@ class ParseableProvider(BaseProvider):
     ]
 }}"""
 
+    SEVERITIES_MAP = {
+        "disaster": AlertSeverity.CRITICAL,
+        "high": AlertSeverity.HIGH,
+        "average": AlertSeverity.WARNING,
+        "low": AlertSeverity.LOW,
+    }
+
+    STATUS_MAP = {
+        "firing": AlertStatus.FIRING,
+        "resolved": AlertStatus.RESOLVED,
+        "acknowledged": AlertStatus.ACKNOWLEDGED,
+        "pending": AlertStatus.PENDING,
+        "suppressed": AlertStatus.SUPPRESSED,
+    }
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -103,28 +119,26 @@ class ParseableProvider(BaseProvider):
         )
 
     @staticmethod
-    def __get_priorty(priority):
-        if priority == "disaster":
-            return "critical"
-        elif priority == "high":
-            return "high"
-        elif priority == "average":
-            return "medium"
-        else:
-            return "low"
-
-    @staticmethod
-    def format_alert(event: dict) -> AlertDto:
+    def _format_alert(
+        event: dict, provider_instance: "BaseProvider" = None
+    ) -> AlertDto:
         environment = "unknown"
         id = event.pop("id", str(uuid4()))
         name = event.pop("alert", "")
-        status = event.pop("status", "firing")
+        # map severity and status to keep's format
+        status = ParseableProvider.STATUS_MAP.get(
+            event.pop("status", None), AlertStatus.FIRING
+        )
+        severity = ParseableProvider.SEVERITIES_MAP.get(
+            event.pop("severity", "").lower(), AlertSeverity.INFO
+        )
+
         lastReceived = event.pop("last_received", datetime.datetime.now().isoformat())
         decription = event.pop("failing_condition", "")
         tags = event.get("tags", {})
         if isinstance(tags, dict):
             environment = tags.get("environment", "unknown")
-        severity = ParseableProvider.__get_priorty(event.pop("severity", "").lower())
+
         return AlertDto(
             **event,
             id=id,
@@ -139,7 +153,7 @@ class ParseableProvider(BaseProvider):
         )
 
     @staticmethod
-    def parse_event_raw_body(raw_body: bytes) -> bytes:
+    def parse_event_raw_body(raw_body: bytes | dict) -> dict:
         """
         Parse the raw body of the event.
         > b'Alert: Server side error triggered on teststream1\nMessage: server reporting status as 500\nFailing Condition: status column equal to abcd, 2 times'
@@ -163,7 +177,7 @@ class ParseableProvider(BaseProvider):
                     event[key.lower().replace(" ", "_")] = value
                 except Exception as e:
                     logger.error(f"Failed to parse line {line} with error {e}")
-        return json.dumps(event).encode()
+        return event
 
 
 if __name__ == "__main__":

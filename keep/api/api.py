@@ -1,130 +1,266 @@
+import asyncio
 import logging
 import os
-import threading
-import time
+from contextlib import asynccontextmanager
+from importlib import metadata
 
-import jwt
 import requests
 import uvicorn
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from starlette.middleware.cors import CORSMiddleware
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
 import keep.api.logging
 import keep.api.observability
-from keep.api.core.config import AuthenticationType
-from keep.api.core.db import create_db_and_tables, get_user, try_create_single_tenant
-from keep.api.core.dependencies import (
-    SINGLE_TENANT_UUID,
-    get_user_email,
-    get_user_email_single_tenant,
-    verify_api_key,
-    verify_api_key_single_tenant,
-    verify_bearer_token,
-    verify_bearer_token_single_tenant,
-    verify_token_or_key,
-    verify_token_or_key_single_tenant,
+import keep.api.utils.import_ee
+from keep.api.arq_worker import get_arq_worker
+from keep.api.consts import (
+    KEEP_ARQ_QUEUE_BASIC,
+    KEEP_ARQ_TASK_POOL,
+    KEEP_ARQ_TASK_POOL_ALL,
+    KEEP_ARQ_TASK_POOL_BASIC_PROCESSING,
+    KEEP_ARQ_TASK_POOL_NONE,
 )
+from keep.api.core.config import config
+from keep.api.core.db import dispose_session
+from keep.api.core.dependencies import SINGLE_TENANT_UUID
+from keep.api.core.limiter import limiter
 from keep.api.logging import CONFIG as logging_config
+from keep.api.middlewares import LoggingMiddleware
 from keep.api.routes import (
+    actions,
     ai,
     alerts,
+    dashboard,
+    deduplications,
+    extraction,
     healthcheck,
+    incidents,
+    maintenance,
+    mapping,
+    metrics,
+    preset,
     providers,
     pusher,
+    rules,
     settings,
     status,
-    tenant,
+    tags,
+    topology,
     whoami,
     workflows,
 )
+from keep.api.routes.auth import groups as auth_groups
+from keep.api.routes.auth import permissions, roles, users
 from keep.event_subscriber.event_subscriber import EventSubscriber
-from keep.posthog.posthog import get_posthog_client
+from keep.identitymanager.identitymanagerfactory import (
+    IdentityManagerFactory,
+    IdentityManagerTypes,
+)
+from keep.topologies.topology_processor import TopologyProcessor
+
+# load all providers into cache
 from keep.workflowmanager.workflowmanager import WorkflowManager
 
 load_dotenv(find_dotenv())
-keep.api.logging.setup()
+keep.api.logging.setup_logging()
 logger = logging.getLogger(__name__)
 
-HOST = os.environ.get("KEEP_HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", 8080))
-SCHEDULER = os.environ.get("SCHEDULER", "true") == "true"
-CONSUMER = os.environ.get("CONSUMER", "true") == "true"
-AUTH_TYPE = os.environ.get("AUTH_TYPE", AuthenticationType.NO_AUTH.value)
+HOST = config("KEEP_HOST", default="0.0.0.0")
+PORT = config("PORT", default=8080, cast=int)
+SCHEDULER = config("SCHEDULER", default="true", cast=bool)
+CONSUMER = config("CONSUMER", default="true", cast=bool)
+TOPOLOGY = config("KEEP_TOPOLOGY_PROCESSOR", default="false", cast=bool)
+KEEP_DEBUG_TASKS = config("KEEP_DEBUG_TASKS", default="false", cast=bool)
+
+AUTH_TYPE = config("AUTH_TYPE", default=IdentityManagerTypes.NOAUTH.value).lower()
+try:
+    KEEP_VERSION = metadata.version("keep")
+except Exception:
+    KEEP_VERSION = config("KEEP_VERSION", default="unknown")
+
+# Monkey patch requests to disable redirects
+original_request = requests.Session.request
 
 
-class EventCaptureMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI):
-        super().__init__(app)
-        self.posthog_client = get_posthog_client()
+def no_redirect_request(self, method, url, **kwargs):
+    kwargs["allow_redirects"] = False
+    return original_request(self, method, url, **kwargs)
 
-    def _extract_identity(self, request: Request) -> str:
-        try:
-            token = request.headers.get("Authorization").split(" ")[1]
-            decoded_token = jwt.decode(token, options={"verify_signature": False})
-            return decoded_token.get("email")
-        except Exception:
-            return "anonymous"
 
-    def capture_request(self, request: Request) -> None:
-        identity = self._extract_identity(request)
-        self.posthog_client.capture(
-            identity,
-            "request-started",
-            {"path": request.url.path, "method": request.method},
-        )
+requests.Session.request = no_redirect_request
 
-    def capture_response(self, request: Request, response: Response) -> None:
-        identity = self._extract_identity(request)
-        self.posthog_client.capture(
-            identity,
-            "request-finished",
-            {
-                "path": request.url.path,
-                "method": request.method,
-                "status_code": response.status_code,
+
+async def check_pending_tasks(background_tasks: set):
+    while True:
+        events_in_queue = len(background_tasks)
+        logger.info(
+            f"{events_in_queue} background tasks pending",
+            extra={
+                "pending_tasks": events_in_queue,
             },
         )
+        await asyncio.sleep(1)
 
-    def flush(self):
-        logger.info("Flushing Posthog events")
-        self.posthog_client.flush()
-        logger.info("Posthog events flushed")
 
-    async def dispatch(self, request: Request, call_next):
-        # Skip OPTIONS requests
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        # Capture event before request
-        self.capture_request(request)
+async def startup():
+    """
+    This runs for every worker on startup.
+    Read more about lifespan here: https://fastapi.tiangolo.com/advanced/events/#lifespan
+    """
+    logger.info("Disope existing DB connections")
+    # psycopg2.DatabaseError: error with status PGRES_TUPLES_OK and no message from the libpq
+    # https://stackoverflow.com/questions/43944787/sqlalchemy-celery-with-scoped-session-error/54751019#54751019
+    dispose_session()
 
-        response = await call_next(request)
+    logger.info("Starting the services")
 
-        # Capture event after request
-        self.capture_response(request, response)
+    # Start the scheduler
+    if SCHEDULER:
+        try:
+            logger.info("Starting the scheduler")
+            wf_manager = WorkflowManager.get_instance()
+            await wf_manager.start()
+            logger.info("Scheduler started successfully")
+        except Exception:
+            logger.exception("Failed to start the scheduler")
 
-        # Perform async tasks or flush events after the request is handled
-        self.flush()
-        return response
+    # Start the consumer
+    if CONSUMER:
+        try:
+            logger.info("Starting the consumer")
+            event_subscriber = EventSubscriber.get_instance()
+            # TODO: there is some "race condition" since if the consumer starts before the server,
+            #       and start getting events, it will fail since the server is not ready yet
+            #       we should add a "wait" here to make sure the server is ready
+            await event_subscriber.start()
+            logger.info("Consumer started successfully")
+        except Exception:
+            logger.exception("Failed to start the consumer")
+    # Start the topology processor
+    if TOPOLOGY:
+        try:
+            logger.info("Starting the topology processor")
+            topology_processor = TopologyProcessor.get_instance()
+            await topology_processor.start()
+            logger.info("Topology processor started successfully")
+        except Exception:
+            logger.exception("Failed to start the topology processor")
+
+    if KEEP_ARQ_TASK_POOL != KEEP_ARQ_TASK_POOL_NONE:
+        event_loop = asyncio.get_event_loop()
+        if KEEP_ARQ_TASK_POOL == KEEP_ARQ_TASK_POOL_ALL:
+            logger.info("Starting all task pools")
+            basic_worker = get_arq_worker(KEEP_ARQ_QUEUE_BASIC)
+            event_loop.create_task(basic_worker.async_run())
+        elif KEEP_ARQ_TASK_POOL == KEEP_ARQ_TASK_POOL_BASIC_PROCESSING:
+            logger.info("Starting Basic Processing task pool")
+            arq_worker = get_arq_worker(KEEP_ARQ_QUEUE_BASIC)
+            event_loop.create_task(arq_worker.async_run())
+        else:
+            raise ValueError(f"Invalid task pool: {KEEP_ARQ_TASK_POOL}")
+
+    logger.info("Services started successfully")
+
+
+async def shutdown():
+    """
+    This runs for every worker on shutdown.
+    Read more about lifespan here: https://fastapi.tiangolo.com/advanced/events/#lifespan
+    """
+    logger.info("Shutting down Keep")
+    if SCHEDULER:
+        logger.info("Stopping the scheduler")
+        wf_manager = WorkflowManager.get_instance()
+        # stop the scheduler
+        try:
+            await wf_manager.stop()
+        # in pytest, there could be race condition
+        except TypeError:
+            pass
+        logger.info("Scheduler stopped successfully")
+    if CONSUMER:
+        logger.info("Stopping the consumer")
+        event_subscriber = EventSubscriber.get_instance()
+        try:
+            await event_subscriber.stop()
+        # in pytest, there could be race condition
+        except TypeError:
+            pass
+        logger.info("Consumer stopped successfully")
+    # ARQ workers stops themselves? see "shutdown on SIGTERM" in logs
+    logger.info("Keep shutdown complete")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    This runs for every worker on startup and shutdown.
+    Read more about lifespan here: https://fastapi.tiangolo.com/advanced/events/#lifespan
+    """
+    app.state.limiter = limiter
+    # create a set of background tasks
+    background_tasks = set()
+    # if debug tasks are enabled, create a task to check for pending tasks
+    if KEEP_DEBUG_TASKS:
+        logger.info("Starting background task to check for pending tasks")
+        asyncio.create_task(check_pending_tasks(background_tasks))
+
+    # Startup
+    await startup()
+
+    # yield the background tasks, this is available for the app to use in request context
+    yield {"background_tasks": background_tasks}
+
+    # Shutdown
+    await shutdown()
 
 
 def get_app(
-    auth_type: AuthenticationType = AuthenticationType.NO_AUTH.value,
+    auth_type: IdentityManagerTypes = IdentityManagerTypes.NOAUTH.value,
 ) -> FastAPI:
-    if not os.environ.get("KEEP_API_URL", None):
+    keep_api_url = config("KEEP_API_URL", default=None)
+    if not keep_api_url:
+        logger.info(
+            "KEEP_API_URL is not set, setting it to default",
+            extra={"keep_api_url": f"http://{HOST}:{PORT}"},
+        )
         os.environ["KEEP_API_URL"] = f"http://{HOST}:{PORT}"
-        logger.info(f"Starting Keep with {os.environ['KEEP_API_URL']} as URL")
+
+    logger.info(
+        f"Starting Keep with {os.environ['KEEP_API_URL']} as URL and version {KEEP_VERSION}",
+        extra={
+            "keep_version": KEEP_VERSION,
+            "keep_api_url": keep_api_url,
+        },
+    )
 
     app = FastAPI(
         title="Keep API",
         description="Rest API powering https://platform.keephq.dev and friends 🏄‍♀️",
-        version="0.1.0",
+        version=KEEP_VERSION,
+        lifespan=lifespan,
     )
+
+    @app.get("/", include_in_schema=False)
+    async def root():
+        """
+        App description and version.
+        """
+        return {"message": app.description, "version": KEEP_VERSION}
+
     app.add_middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(),))
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(
+        GZipMiddleware, minimum_size=30 * 1024 * 1024
+    )  # Approximately 30 MiB, https://cloud.google.com/run/quotas
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -132,15 +268,12 @@ def get_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    if not os.getenv("DISABLE_POSTHOG", "false") == "true":
-        app.add_middleware(EventCaptureMiddleware)
-    # app.add_middleware(GZipMiddleware)
-
     app.include_router(providers.router, prefix="/providers", tags=["providers"])
-    app.include_router(healthcheck.router, prefix="/healthcheck", tags=["healthcheck"])
-    app.include_router(tenant.router, prefix="/tenant", tags=["tenant"])
+    app.include_router(actions.router, prefix="/actions", tags=["actions"])
     app.include_router(ai.router, prefix="/ai", tags=["ai"])
+    app.include_router(healthcheck.router, prefix="/healthcheck", tags=["healthcheck"])
     app.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
+    app.include_router(incidents.router, prefix="/incidents", tags=["incidents"])
     app.include_router(settings.router, prefix="/settings", tags=["settings"])
     app.include_router(
         workflows.router, prefix="/workflows", tags=["workflows", "alerts"]
@@ -148,77 +281,43 @@ def get_app(
     app.include_router(whoami.router, prefix="/whoami", tags=["whoami"])
     app.include_router(pusher.router, prefix="/pusher", tags=["pusher"])
     app.include_router(status.router, prefix="/status", tags=["status"])
-
+    app.include_router(rules.router, prefix="/rules", tags=["rules"])
+    app.include_router(preset.router, prefix="/preset", tags=["preset"])
+    app.include_router(
+        mapping.router, prefix="/mapping", tags=["enrichment", "mapping"]
+    )
+    app.include_router(
+        auth_groups.router, prefix="/auth/groups", tags=["auth", "groups"]
+    )
+    app.include_router(
+        permissions.router, prefix="/auth/permissions", tags=["auth", "permissions"]
+    )
+    app.include_router(roles.router, prefix="/auth/roles", tags=["auth", "roles"])
+    app.include_router(users.router, prefix="/auth/users", tags=["auth", "users"])
+    app.include_router(metrics.router, prefix="/metrics", tags=["metrics"])
+    app.include_router(
+        extraction.router, prefix="/extraction", tags=["enrichment", "extraction"]
+    )
+    app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+    app.include_router(tags.router, prefix="/tags", tags=["tags"])
+    app.include_router(maintenance.router, prefix="/maintenance", tags=["maintenance"])
+    app.include_router(topology.router, prefix="/topology", tags=["topology"])
+    app.include_router(
+        deduplications.router, prefix="/deduplications", tags=["deduplications"]
+    )
     # if its single tenant with authentication, add signin endpoint
     logger.info(f"Starting Keep with authentication type: {AUTH_TYPE}")
     # If we run Keep with SINGLE_TENANT auth type, we want to add the signin endpoint
-    if AUTH_TYPE == AuthenticationType.SINGLE_TENANT.value:
-
-        @app.post("/signin")
-        def signin(body: dict):
-            # validate the user/password
-            user = get_user(body.get("username"), body.get("password"))
-
-            if not user:
-                return JSONResponse(
-                    status_code=401,
-                    content={"message": "Invalid username or password"},
-                )
-            # generate a JWT secret
-            jwt_secret = os.environ.get("KEEP_JWT_SECRET")
-            if not jwt_secret:
-                raise HTTPException(status_code=401, detail="Missing JWT secret")
-            token = jwt.encode(
-                {
-                    "email": f"{user.username}@keephq.com",
-                    "tenant_id": SINGLE_TENANT_UUID,
-                },
-                jwt_secret,
-                algorithm="HS256",
-            )
-            # return the token
-            return {"accessToken": token, "tenantId": SINGLE_TENANT_UUID}
-
-    from fastapi import BackgroundTasks
-
-    @app.post("/start-services")
-    async def start_services(background_tasks: BackgroundTasks):
-        logger.info("Starting the internal services")
-        if SCHEDULER:
-            logger.info("Starting the scheduler")
-            wf_manager = WorkflowManager.get_instance()
-            background_tasks.add_task(wf_manager.start)
-            logger.info("Scheduler started successfully")
-
-        if CONSUMER:
-            logger.info("Starting the consumer")
-            event_subscriber = EventSubscriber.get_instance()
-            background_tasks.add_task(event_subscriber.start)
-            logger.info("Consumer started successfully")
-
-        return {"status": "Services are starting in the background"}
-
-    @app.on_event("startup")
-    async def on_startup():
-        if not os.environ.get("SKIP_DB_CREATION", "false") == "true":
-            create_db_and_tables()
-
-        # When running in mode other than multi tenant auth, we want to override the secured endpoints
-        if AUTH_TYPE != AuthenticationType.MULTI_TENANT.value:
-            app.dependency_overrides[verify_api_key] = verify_api_key_single_tenant
-            app.dependency_overrides[
-                verify_bearer_token
-            ] = verify_bearer_token_single_tenant
-            app.dependency_overrides[get_user_email] = get_user_email_single_tenant
-            app.dependency_overrides[
-                verify_token_or_key
-            ] = verify_token_or_key_single_tenant
-            try_create_single_tenant(SINGLE_TENANT_UUID)
+    identity_manager = IdentityManagerFactory.get_identity_manager(
+        SINGLE_TENANT_UUID, None, AUTH_TYPE
+    )
+    # if any endpoints needed, add them on_start
+    identity_manager.on_start(app)
 
     @app.exception_handler(Exception)
     async def catch_exception(request: Request, exc: Exception):
         logging.error(
-            f"An unhandled exception occurred: {exc}, Trace ID: {request.state.trace_id}"
+            f"An unhandled exception occurred: {exc}, Trace ID: {request.state.trace_id}. Tenant ID: {request.state.tenant_id}"
         )
         return JSONResponse(
             status_code=500,
@@ -229,69 +328,33 @@ def get_app(
             },
         )
 
-    keep.api.observability.setup(app)
+    app.add_middleware(LoggingMiddleware)
 
-    if os.environ.get("USE_NGROK", "false") == "true":
-        from pyngrok import ngrok
+    if config("KEEP_METRICS", default="true", cast=bool):
+        Instrumentator(
+            excluded_handlers=["/metrics", "/metrics/processing"],
+            should_group_status_codes=False,
+        ).instrument(app=app, metric_namespace="keep")
 
-        public_url = ngrok.connect(PORT).public_url
-        logger.info(f"ngrok tunnel: {public_url}")
-        os.environ["KEEP_API_URL"] = public_url
+    if config("KEEP_OTEL_ENABLED", default="true", cast=bool):
+        keep.api.observability.setup(app)
 
     return app
 
 
-def run_services_after_app_is_up():
-    """Waits until the server is up and than invoking the 'start-services' endpoint to start the internal services"""
-    logger.info("Waiting for the server to be ready")
-    _wait_for_server_to_be_ready()
-    logger.info("Server is ready, starting the internal services")
-    # start the internal services
-    try:
-        # the internal services are always on localhost
-        response = requests.post(f"http://localhost:{PORT}/start-services")
-        response.raise_for_status()
-        logger.info("Internal services started successfully")
-    except Exception as e:
-        logger.info("Failed to start internal services")
-        raise e
-
-
-def _is_server_ready() -> bool:
-    # poll localhost to see if the server is up
-    try:
-        # we are using hardcoded "localhost" to avoid problems where we start Keep on platform such as CloudRun where we have more than one instance
-        response = requests.get(f"http://localhost:{PORT}/healthcheck", timeout=1)
-        response.raise_for_status()
-        return True
-    except Exception:
-        return False
-
-
-def _wait_for_server_to_be_ready():
-    """Wait until the server is up by polling localhost"""
-    start_time = time.time()
-    while True:
-        if _is_server_ready():
-            return True
-        if time.time() - start_time >= 60:
-            raise TimeoutError("Server is not ready after 60 seconds.")
-        else:
-            logger.warning("Server is not ready yet, retrying in 1 second...")
-        time.sleep(1)
-
-
 def run(app: FastAPI):
-    # We want to start all internal services (workflowmanager, eventsubscriber, etc) only after the server is up
-    # so we init a thread that will wait for the server to be up and then start the internal services
-    logger.info("Starting the run services thread")
-    thread = threading.Thread(target=run_services_after_app_is_up)
-    thread.start()
     logger.info("Starting the uvicorn server")
-    # run the server
+    # call on starting to create the db and tables
+    import keep.api.config
+
+    keep.api.config.on_starting()
+
     uvicorn.run(
-        app,
+        "keep.api.api:get_app",
         host=HOST,
         port=PORT,
         log_config=logging_config,
+        lifespan="on",
+        workers=config("KEEP_WORKERS", default=None, cast=int),
+        limit_concurrency=config("KEEP_LIMIT_CONCURRENCY", default=None, cast=int),
     )

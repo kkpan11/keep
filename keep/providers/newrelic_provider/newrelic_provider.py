@@ -4,17 +4,19 @@ NewrelicProvider is a provider that provides a way to interact with New Relic.
 
 import dataclasses
 import json
+import logging
 from datetime import datetime
 
 import pydantic
 import requests
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.exceptions.provider_config_exception import ProviderConfigException
 from keep.exceptions.provider_exception import ProviderException
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
+from keep.validation.fields import HttpsUrl
 
 
 @pydantic.dataclasses.dataclass
@@ -36,17 +38,22 @@ class NewrelicProviderAuthConfig:
     account_id: str = dataclasses.field(
         metadata={"required": True, "description": "New Relic account ID"}
     )
-    new_relic_api_url: str = dataclasses.field(
+    new_relic_api_url: HttpsUrl = dataclasses.field(
         metadata={
             "required": False,
             "description": "New Relic API URL",
+            "validation": "https_url"
         },
         default="https://api.newrelic.com",
     )
 
 
 class NewrelicProvider(BaseProvider):
+    """Get alerts from New Relic into Keep."""
+
+    PROVIDER_CATEGORY = ["Monitoring"]
     NEWRELIC_WEBHOOK_NAME = "keep-webhook"
+    PROVIDER_DISPLAY_NAME = "New Relic"
     PROVIDER_SCOPES = [
         ProviderScope(
             name="ai.issues:read",
@@ -90,6 +97,18 @@ class NewrelicProvider(BaseProvider):
         ),
     ]
 
+    SEVERITIES_MAP = {
+        "critical": AlertSeverity.CRITICAL,
+        "warning": AlertSeverity.WARNING,
+        "info": AlertSeverity.INFO,
+    }
+
+    STATUS_MAP = {
+        "open": AlertStatus.FIRING,
+        "closed": AlertStatus.RESOLVED,
+        "acknowledged": AlertStatus.ACKNOWLEDGED,
+    }
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -104,10 +123,6 @@ class NewrelicProvider(BaseProvider):
     def validate_config(self):
         """
         Validates required configuration for New-Relic provider.
-
-        Raises:
-            ProviderConfigException: user or account is missing in authentication.
-            ProviderConfigException: private key
         """
         self.newrelic_config = NewrelicProviderAuthConfig(**self.config.authentication)
 
@@ -148,7 +163,7 @@ class NewrelicProvider(BaseProvider):
         }
 
     def validate_scopes(self) -> dict[str, bool | str]:
-        scopes = {scope.name: False for scope in self.PROVIDER_SCOPES}
+        scopes = {scope.name: "Invalid" for scope in self.PROVIDER_SCOPES}
         read_scopes = [key for key in scopes.keys() if "read" in key]
 
         try:
@@ -384,9 +399,9 @@ class NewrelicProvider(BaseProvider):
                 )
             alert = AlertDto(
                 id=issue["issueId"],
-                name=issue["title"][0]
-                if issue["title"]
-                else None,  # Assuming the first title in the list
+                name=(
+                    issue["title"][0] if issue["title"] else None
+                ),  # Assuming the first title in the list
                 status=issue["state"],
                 lastReceived=lastReceived,
                 severity=issue["priority"],
@@ -405,15 +420,55 @@ class NewrelicProvider(BaseProvider):
         return formatted_alerts
 
     @staticmethod
-    def format_alert(event: dict) -> AlertDto:
+    def _format_alert(
+        event: dict, provider_instance: "BaseProvider" = None
+    ) -> AlertDto:
         """We are already registering template same as generic AlertDTO"""
-        lastReceived = event["lastReceived"] if "lastReceived" in event else None
+        logger = logging.getLogger(__name__)
+        logger.info("Got event from New Relic")
+        lastReceived = event.pop("lastReceived", None)
+        # from Keep policy
         if lastReceived:
-            lastReceived = datetime.utcfromtimestamp(lastReceived / 1000).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            event["lastReceived"] = lastReceived
-        return AlertDto(**event)
+            if isinstance(lastReceived, int):
+                lastReceived = datetime.utcfromtimestamp(
+                    lastReceived / 1000
+                ).isoformat()
+            else:
+                # WTF?
+                logger.error("lastReceived is not int")
+                pass
+        else:
+            lastReceived = datetime.utcfromtimestamp(
+                event.get("updatedAt", 0) / 1000
+            ).isoformat()
+
+        # format status and severity to Keep format
+        status = event.pop("status", "") or event.pop("state", "")
+        status = NewrelicProvider.STATUS_MAP.get(status.lower(), AlertStatus.FIRING)
+
+        severity = event.pop("severity", "") or event.pop("priority", "")
+        severity = NewrelicProvider.SEVERITIES_MAP.get(
+            severity.lower(), AlertSeverity.INFO
+        )
+
+        name = event.pop("name", "")
+        if not name:
+            name = event.get("title", "")
+
+        logger.info("Formatted event from New Relic")
+        # TypeError: keep.api.models.alert.AlertDto() got multiple values for keyword argument 'source'"
+        if "source" in event:
+            newrelic_source = event.pop("source")
+
+        return AlertDto(
+            source=["newrelic"],
+            name=name,
+            lastReceived=lastReceived,
+            status=status,
+            severity=severity,
+            newrelic_source=newrelic_source,
+            **event,
+        )
 
     def __get_all_policy_ids(
         self,

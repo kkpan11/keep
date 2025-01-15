@@ -1,6 +1,7 @@
 """
 ServicenowProvider is a class that implements the BaseProvider interface for Service Now updates.
 """
+
 import dataclasses
 import json
 
@@ -8,23 +9,25 @@ import pydantic
 import requests
 from requests.auth import HTTPBasicAuth
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.db.topology import TopologyServiceInDto
 from keep.contextmanager.contextmanager import ContextManager
 from keep.exceptions.provider_exception import ProviderException
-from keep.providers.base.base_provider import BaseProvider
+from keep.providers.base.base_provider import BaseTopologyProvider
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
+from keep.validation.fields import HttpsUrl
 
 
 @pydantic.dataclasses.dataclass
 class ServicenowProviderAuthConfig:
     """ServiceNow authentication configuration."""
 
-    service_now_base_url: str = dataclasses.field(
+    service_now_base_url: HttpsUrl = dataclasses.field(
         metadata={
             "required": True,
             "description": "The base URL of the ServiceNow instance",
             "sensitive": False,
             "hint": "https://dev12345.service-now.com",
+            "validation": "https_url",
         }
     )
 
@@ -44,10 +47,30 @@ class ServicenowProviderAuthConfig:
         }
     )
 
+    # @tb: based on this https://www.servicenow.com/community/developer-blog/oauth-2-0-with-inbound-rest/ba-p/2278926
+    client_id: str = dataclasses.field(
+        metadata={
+            "required": False,
+            "description": "The client ID to use OAuth 2.0 based authentication",
+            "sensitive": False,
+        },
+        default="",
+    )
 
-class ServicenowProvider(BaseProvider):
+    client_secret: str = dataclasses.field(
+        metadata={
+            "required": False,
+            "description": "The client secret to use OAuth 2.0 based authentication",
+            "sensitive": True,
+        },
+        default="",
+    )
+
+
+class ServicenowProvider(BaseTopologyProvider):
     """Manage ServiceNow tickets."""
 
+    PROVIDER_CATEGORY = ["Ticketing"]
     PROVIDER_SCOPES = [
         ProviderScope(
             name="itil",
@@ -58,38 +81,94 @@ class ServicenowProvider(BaseProvider):
         )
     ]
     PROVIDER_TAGS = ["ticketing"]
+    PROVIDER_DISPLAY_NAME = "Service Now"
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
         super().__init__(context_manager, provider_id, config)
+        self._access_token = None
+        if (
+            self.authentication_config.client_id
+            and self.authentication_config.client_secret
+        ):
+            url = f"{self.authentication_config.service_now_base_url}/oauth_token.do"
+            payload = {
+                "grant_type": "password",
+                "username": self.authentication_config.username,
+                "password": self.authentication_config.password,
+                "client_id": self.authentication_config.client_id,
+                "client_secret": self.authentication_config.client_secret,
+            }
+            response = requests.post(
+                url,
+                json=payload,
+            )
+            if response.ok:
+                self._access_token = response.json().get("access_token")
+            else:
+                self.logger.error(
+                    "Failed to get access token",
+                    extra={
+                        "response": response.text,
+                        "status_code": response.status_code,
+                    },
+                )
 
     def validate_scopes(self):
         """
         Validates that the user has the required scopes to use the provider.
         """
         try:
+            self.logger.info("Validating ServiceNow scopes")
             url = f"{self.authentication_config.service_now_base_url}/api/now/table/sys_user_role?sysparm_query=user_name={self.authentication_config.username}"
-            response = requests.get(
-                url,
-                auth=HTTPBasicAuth(
-                    self.authentication_config.username,
-                    self.authentication_config.password,
-                ),
-            )
-            if response.status_code == 200:
+            if self._access_token:
+                response = requests.get(
+                    url,
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                    verify=False,
+                    timeout=10,
+                )
+            else:
+                response = requests.get(
+                    url,
+                    auth=HTTPBasicAuth(
+                        self.authentication_config.username,
+                        self.authentication_config.password,
+                    ),
+                    verify=False,
+                    timeout=10,
+                )
+
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                self.logger.exception(f"Failed to get roles from ServiceNow: {e}")
+                scopes = {"itil": str(e)}
+                return scopes
+
+            if response.ok:
                 roles = response.json()
                 roles_names = [role.get("name") for role in roles.get("result")]
                 if "itil" in roles_names:
+                    self.logger.info("User has ITIL role")
                     scopes = {
                         "itil": True,
                     }
                 else:
+                    self.logger.info("User does not have ITIL role")
                     scopes = {
                         "itil": "This user does not have the ITIL role",
                     }
             else:
-                scopes["itil"] = "Failed to get roles from ServiceNow"
+                self.logger.error(
+                    "Failed to get roles from ServiceNow",
+                    extra={
+                        "response": response.text,
+                        "status_code": response.status_code,
+                    },
+                )
+                scopes = {"itil": "Failed to get roles from ServiceNow"}
         except Exception as e:
             self.logger.exception("Error validating scopes")
             scopes = {
@@ -102,6 +181,176 @@ class ServicenowProvider(BaseProvider):
             **self.config.authentication
         )
 
+    def _query(
+        self,
+        table_name: str,
+        incident_id: str = None,
+        sysparm_limit: int = 100,
+        sysparm_offset: int = 0,
+        **kwargs: dict,
+    ):
+        request_url = f"{self.authentication_config.service_now_base_url}/api/now/table/{table_name}"
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        auth = (
+            (
+                self.authentication_config.username,
+                self.authentication_config.password,
+            )
+            if not self._access_token
+            else None
+        )
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+
+        if incident_id:
+            request_url = f"{request_url}/{incident_id}"
+
+        params = {"sysparm_offset": 0, "sysparm_limit": 100}
+        # Add pagination parameters if not already set
+        if sysparm_limit:
+            params["sysparm_limit"] = (
+                sysparm_limit  # Limit number of records per request
+            )
+        if sysparm_offset:
+            params["sysparm_offset"] = 0  # Start from beginning
+
+        response = requests.get(
+            request_url,
+            headers=headers,
+            auth=auth,
+            params=params,
+            verify=False,
+            timeout=10,
+        )
+
+        if not response.ok:
+            self.logger.error(
+                f"Failed to query {table_name}",
+                extra={"status_code": response.status_code, "response": response.text},
+            )
+            return []
+
+        return response.json().get("result", [])
+
+    def pull_topology(self) -> tuple[list[TopologyServiceInDto], dict]:
+        # TODO: in scale, we'll need to use pagination around here
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        auth = (
+            (
+                self.authentication_config.username,
+                self.authentication_config.password,
+            )
+            if not self._access_token
+            else None
+        )
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+        topology = []
+        self.logger.info(
+            "Pulling topology", extra={"tenant_id": self.context_manager.tenant_id}
+        )
+
+        self.logger.info("Pulling CMDB items")
+        fields = [
+            "name",
+            "sys_id",
+            "ip_address",
+            "mac_address",
+            "owned_by.name"
+            "manufacturer.name",  # Retrieve the name of the manufacturer
+            "short_description",
+            "environment",
+        ]
+
+        # Set parameters for the request
+        cmdb_params = {
+            "sysparm_fields": ",".join(fields),
+            "sysparm_query": "active=true",
+        }
+        cmdb_response = requests.get(
+            f"{self.authentication_config.service_now_base_url}/api/now/table/cmdb_ci",
+            headers=headers,
+            auth=auth,
+            params=cmdb_params,
+        )
+
+        if not cmdb_response.ok:
+            self.logger.error(
+                "Failed to pull topology",
+                extra={
+                    "tenant_id": self.context_manager.tenant_id,
+                    "status_code": cmdb_response.status_code,
+                },
+            )
+            return topology, {}
+
+        cmdb_data = cmdb_response.json().get("result", [])
+        self.logger.info(
+            "Pulling CMDB items completed", extra={"len_of_cmdb_items": len(cmdb_data)}
+        )
+
+        self.logger.info("Pulling relationship types")
+        relationship_types = {}
+        rel_type_response = requests.get(
+            f"{self.authentication_config.service_now_base_url}/api/now/table/cmdb_rel_type",
+            auth=auth,
+            headers=headers,
+        )
+        if not rel_type_response.ok:
+            self.logger.error("Failed to get topology types")
+        else:
+            rel_type_json = rel_type_response.json()
+            for result in rel_type_json.get("result", []):
+                relationship_types[result.get("sys_id")] = result.get("sys_name")
+            self.logger.info("Pulling relationship types completed")
+
+        self.logger.info("Pulling relationships")
+        relationships = {}
+        rel_response = requests.get(
+            f"{self.authentication_config.service_now_base_url}/api/now/table/cmdb_rel_ci",
+            auth=auth,
+            headers=headers,
+        )
+        if not rel_response.ok:
+            self.logger.error("Failed to get topology relationships")
+        else:
+            rel_json = rel_response.json()
+            for relationship in rel_json.get("result", []):
+                parent_id = relationship.get("parent", {}).get("value")
+                child_id = relationship.get("child", {}).get("value")
+                relationship_type_id = relationship.get("type", {}).get("value")
+                relationship_type = relationship_types.get(relationship_type_id)
+                if parent_id not in relationships:
+                    relationships[parent_id] = {}
+                relationships[parent_id][child_id] = relationship_type
+            self.logger.info("Pulling relationships completed")
+
+        self.logger.info("Mixing up all topology data")
+        for entity in cmdb_data:
+            sys_id = entity.get("sys_id")
+            owned_by = entity.get("owned_by.name")
+            topology_service = TopologyServiceInDto(
+                source_provider_id=self.provider_id,
+                service=sys_id,
+                display_name=entity.get("name"),
+                description=entity.get("short_description"),
+                environment=entity.get("environment"),
+                team=owned_by,
+                dependencies=relationships.get(sys_id, {}),
+                ip_address=entity.get("ip_address"),
+                mac_address=entity.get("mac_address"),
+            )
+            topology.append(topology_service)
+
+        self.logger.info(
+            "Topology pulling completed",
+            extra={
+                "tenant_id": self.context_manager.tenant_id,
+                "len_of_topology": len(topology),
+            },
+        )
+        return topology, {}
+
     def dispose(self):
         """
         No need to dispose of anything, so just do nothing.
@@ -111,7 +360,16 @@ class ServicenowProvider(BaseProvider):
     def _notify(self, table_name: str, payload: dict = {}, **kwargs: dict):
         # Create ticket
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-
+        auth = (
+            (
+                self.authentication_config.username,
+                self.authentication_config.password,
+            )
+            if not self._access_token
+            else None
+        )
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
         # otherwise, create the ticket
         if not table_name:
             raise ProviderException("Table name is required")
@@ -129,12 +387,10 @@ class ServicenowProvider(BaseProvider):
         # HTTP request
         response = requests.post(
             url,
-            auth=(
-                self.authentication_config.username,
-                self.authentication_config.password,
-            ),
+            auth=auth,
             headers=headers,
             data=json.dumps(payload),
+            verify=False,
         )
 
         if response.status_code == 201:  # HTTP status code for "Created"
@@ -142,9 +398,9 @@ class ServicenowProvider(BaseProvider):
             self.logger.info(f"Created ticket: {resp}")
             result = resp.get("result")
             # Add link to ticket
-            result[
-                "link"
-            ] = f"{self.authentication_config.service_now_base_url}/now/nav/ui/classic/params/target/{table_name}.do%3Fsys_id%3D{result['sys_id']}"
+            result["link"] = (
+                f"{self.authentication_config.service_now_base_url}/now/nav/ui/classic/params/target/{table_name}.do%3Fsys_id%3D{result['sys_id']}"
+            )
             return result
         # if the instance is down due to hibranate you'll get 200 instead of 201
         elif response.status_code == 200:
@@ -159,13 +415,22 @@ class ServicenowProvider(BaseProvider):
     def _notify_update(self, table_name: str, ticket_id: str, fingerprint: str):
         url = f"{self.authentication_config.service_now_base_url}/api/now/table/{table_name}/{ticket_id}"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        response = requests.get(
-            url,
-            auth=(
+        auth = (
+            (
                 self.authentication_config.username,
                 self.authentication_config.password,
-            ),
+            )
+            if self._access_token
+            else None
+        )
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+
+        response = requests.get(
+            url,
+            auth=auth,
             headers=headers,
+            verify=False,
         )
         if response.status_code == 200:
             resp = response.text
@@ -215,21 +480,5 @@ if __name__ == "__main__":
         context_manager, provider_id="servicenow", config=config
     )
 
-    # mock alert
-    context_manager = provider.context_manager
-
-    alert = AlertDto.parse_obj(
-        json.loads(
-            '{"id": "4c54ce9a0d458b574d0aaa5fad23f44ce006e45bdf16fa65207cc6131979c000", "name": "Error in lambda", "status": "ALARM", "lastReceived": "2023-09-18 12:26:21.408000+00:00", "environment": "undefined", "isDuplicate": null, "duplicateReason": null, "service": null, "source": ["cloudwatch"], "message": null, "description": "Hey Shahar\\n\\nThis is a test alarm!", "severity": null, "fatigueMeter": 3, "pushed": true, "event_id": "3cbf2024-a1f0-42ac-9754-b9157c00b95e", "url": null, "AWSAccountId": "1234", "AlarmActions": ["arn:aws:sns:us-west-2:1234:Default_CloudWatch_Alarms_Topic"], "AlarmArn": "arn:aws:cloudwatch:us-west-2:1234:alarm:Error in lambda", "Trigger": {"MetricName": "Errors", "Namespace": "AWS/Lambda", "StatisticType": "Statistic", "Statistic": "AVERAGE", "Unit": null, "Dimensions": [{"value": "helloWorld", "name": "FunctionName"}], "Period": 300, "EvaluationPeriods": 1, "DatapointsToAlarm": 1, "ComparisonOperator": "GreaterThanThreshold", "Threshold": 0.0, "TreatMissingData": "missing", "EvaluateLowSampleCountPercentile": ""}, "Region": "US West (Oregon)", "InsufficientDataActions": [], "AlarmConfigurationUpdatedTimestamp": "2023-08-17T14:29:12.272+0000", "NewStateReason": "Setting state to ALARM for testing", "AlarmName": "Error in lambda", "NewStateValue": "ALARM", "OldStateValue": "INSUFFICIENT_DATA", "AlarmDescription": "Hey Shahar\\n\\nThis is a test alarm!", "OKActions": [], "StateChangeTime": "2023-09-18T12:26:21.408+0000", "trigger": "alert"}'
-        )
-    )
-    context_manager.set_event_context(alert)
-    r = provider.notify(
-        table_name="incident",
-        payload={
-            "short_description": "My new incident",
-            "category": "software",
-            "created_by": "keep",
-        },
-    )
+    r = provider.pull_topology()
     print(r)

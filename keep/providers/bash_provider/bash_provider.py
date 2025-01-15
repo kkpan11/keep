@@ -19,13 +19,19 @@ class BashProvider(BaseProvider):
     def validate_config(self):
         pass
 
-    def _query(self, **kwargs):
+    def _query(
+            self,
+            timeout: int = 60,
+            command: str = "",
+            **kwargs
+            ):
         """Bash provider eval shell command to get results
 
         Returns:
             _type_: _description_
         """
-        command = kwargs.get("command", "")
+        # timeout = kwargs.get("timeout", 60)
+        # command = kwargs.get("command", "")
         parsed_command = self.io_handler.parse(command)
         # parse by pipes
         parsed_commands = parsed_command.split("|")
@@ -57,16 +63,37 @@ class BashProvider(BaseProvider):
             processes.append(process)
 
         # Get the final output
-        stdout, stderr = processes[-1].communicate()
-        return_code = processes[-1].returncode
-        # stdout and stderr are strings or None
-        if stdout:
-            stdout = stdout.decode()
+        try:
+            stdout, stderr = processes[-1].communicate(timeout=timeout)
+            return_code = processes[-1].returncode
+            # stdout and stderr are strings or None
+            if stdout or stdout == b"":
+                stdout = stdout.decode()
 
-        if stderr:
-            stderr = stderr.decode()
+            if stderr or stderr == b"":
+                stderr = stderr.decode()
+        except subprocess.TimeoutExpired:
+            # use check_output to get the output of the last process
+            # this is some MacOS bug, where communicate() doesn't work and raise TimeoutExpired (idk why but it works on Linux)
+            try:
+                self.logger.warning("TimeoutExpired, using check_output - MacOS bug?")
+                stdout = subprocess.check_output(
+                    cmd, stderr=subprocess.STDOUT, timeout=timeout, shell=True
+                ).decode()
+                stderr = None
+                return_code = 0
+                self.logger.warning("check_output worked")
+            # todo: fix that
+            except Exception as e:
+                stdout = None
+                stderr = e.args[1].decode()
+                return_code = e.args[0]
 
-        return {"stdout": stdout, "stderr": stderr, "return_code": return_code}
+        return {
+            "stdout": str(stdout),
+            "stderr": str(stderr),
+            "return_code": return_code,
+        }
 
     def dispose(self):
         """

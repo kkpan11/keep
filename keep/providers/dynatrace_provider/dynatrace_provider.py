@@ -1,17 +1,18 @@
 """
 Kafka Provider is a class that allows to ingest/digest data from Grafana.
 """
+
 import base64
 import dataclasses
 import datetime
+import json
 import logging
 import os
-import random
 
 import pydantic
 import requests
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
@@ -54,6 +55,8 @@ class DynatraceProvider(BaseProvider):
     Dynatrace provider class.
     """
 
+    PROVIDER_CATEGORY = ["Monitoring"]
+
     PROVIDER_SCOPES = [
         ProviderScope(
             name="problems.read",
@@ -74,6 +77,20 @@ class DynatraceProvider(BaseProvider):
             alias="Settings Write",
         ),
     ]
+    FINGERPRINT_FIELDS = ["id"]
+
+    SEVERITIES_MAP = {
+        "AVAILABILITY": AlertSeverity.HIGH,
+        "ERROR": AlertSeverity.CRITICAL,
+        "PERFORMANCE": AlertSeverity.WARNING,
+        "RESOURCE": AlertSeverity.WARNING,
+        "CUSTOM": AlertSeverity.INFO,
+    }
+
+    STATUS_MAP = {
+        "OPEN": AlertStatus.FIRING,
+        "RESOLVED": AlertStatus.RESOLVED,
+    }
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
@@ -104,7 +121,7 @@ class DynatraceProvider(BaseProvider):
             raise Exception(f"Failed to get problems from Dynatrace: {response.text}")
         else:
             return [
-                self.format_alert(event)
+                self._format_alert(event)
                 for event in response.json().get("problems", [])
             ]
 
@@ -119,9 +136,9 @@ class DynatraceProvider(BaseProvider):
                 self.logger.info(
                     "Failed to validate dynatrace scopes - wrong environment id"
                 )
-                scopes[
-                    "problems.read"
-                ] = "Failed to validate scope, wrong environment id (Keep got 404)"
+                scopes["problems.read"] = (
+                    "Failed to validate scope, wrong environment id (Keep got 404)"
+                )
                 scopes["settings.read"] = scopes["problems.read"]
                 scopes["settings.write"] = scopes["problems.read"]
                 return scopes
@@ -130,9 +147,9 @@ class DynatraceProvider(BaseProvider):
                 self.logger.info(
                     "Failed to validate dynatrace scopes - invalid API token"
                 )
-                scopes[
-                    "problems.read"
-                ] = "Invalid API token - authentication failed (401)"
+                scopes["problems.read"] = (
+                    "Invalid API token - authentication failed (401)"
+                )
                 scopes["settings.read"] = scopes["problems.read"]
                 scopes["settings.write"] = scopes["problems.read"]
                 return scopes
@@ -140,9 +157,9 @@ class DynatraceProvider(BaseProvider):
                 self.logger.info(
                     "Failed to validate dynatrace scopes - no problems.read scopes"
                 )
-                scopes[
-                    "problems.read"
-                ] = "Token is missing required scope - problems.read (403)"
+                scopes["problems.read"] = (
+                    "Token is missing required scope - problems.read (403)"
+                )
         else:
             self.logger.info("Validated dynatrace scopes - problems.read")
             scopes["problems.read"] = True
@@ -158,9 +175,9 @@ class DynatraceProvider(BaseProvider):
                 f"Failed to validate dynatrace scopes - settings.read: {e}"
             )
             scopes["settings.read"] = str(e)
-            scopes[
-                "settings.write"
-            ] = "Cannot validate the settings.write scope without the settings.read scope, you need to first add the settings.read scope"
+            scopes["settings.write"] = (
+                "Cannot validate the settings.write scope without the settings.read scope, you need to first add the settings.read scope"
+            )
             # we are done
             return scopes
         # if we have settings.read, we can try settings.write
@@ -181,20 +198,22 @@ class DynatraceProvider(BaseProvider):
             )
             # understand if its localhost:
             if "The environment does not allow for site-local URLs" in str(e):
-                scopes[
-                    "settings.write"
-                ] = "Cannot use localhost as a webhook URL, please use a public URL when installing dynatrace webhook (you can use Keep with ngrok or similar)"
+                scopes["settings.write"] = (
+                    "Cannot use localhost as a webhook URL, please use a public URL when installing dynatrace webhook (you can use Keep with ngrok or similar)"
+                )
             else:
-                scopes[
-                    "settings.write"
-                ] = f"Failed to validate the settings.write scope: {e}"
+                scopes["settings.write"] = (
+                    f"Failed to validate the settings.write scope: {e}"
+                )
             return scopes
 
         self.logger.info(f"Validated dynatrace scopes: {scopes}")
         return scopes
 
     @staticmethod
-    def format_alert(event: dict) -> AlertDto:
+    def _format_alert(
+        event: dict, provider_instance: "BaseProvider" = None
+    ) -> AlertDto:
         # alert that comes from webhook
         if event.get("ProblemID"):
             tags = event.get("Tags", [])
@@ -207,16 +226,22 @@ class DynatraceProvider(BaseProvider):
             pid = event.get("PID", "")
             names_of_impacted_entities = event.get("NamesOfImpactedEntities", "")
             event.get("ProblemDetails", "")
+            # format severity and status to keep's format
+            severity = DynatraceProvider.SEVERITIES_MAP.get(
+                event.get("ProblemSeverity"), AlertSeverity.INFO
+            )
+            status = DynatraceProvider.STATUS_MAP.get(
+                event.get("State"), AlertStatus.FIRING
+            )
 
             alert_dto = AlertDto(
                 id=event.get("ProblemID"),
                 name=event.get("ProblemTitle"),
-                status=event.get("State"),
-                severity=event.get("ProblemSeverity", None),
+                status=status,
+                severity=severity,
                 lastReceived=datetime.datetime.now().isoformat(),
-                fatigueMeter=random.randint(0, 100),
-                description=event.get(
-                    "ImpactedEntities"
+                description=json.dumps(
+                    event.get("ImpactedEntities", {})
                 ),  # was asked by a user (should be configurable)
                 source=["dynatrace"],
                 impact=event.get("ProblemImpact"),
@@ -233,22 +258,29 @@ class DynatraceProvider(BaseProvider):
             )
         # else, problem from the problem API
         else:
-            event.pop("problemId")
+            _id = event.pop("problemId")
             name = event.pop("displayId")
-            status = event.pop("status")
-            severity = event.pop("severityLevel", None)
+            # format severity and status to keep's format
+            severity = DynatraceProvider.SEVERITIES_MAP.get(
+                event.pop("severityLevel", None), AlertSeverity.INFO
+            )
+            status = DynatraceProvider.STATUS_MAP.get(
+                event.pop("status"), AlertStatus.FIRING
+            )
             description = event.pop("title")
             impact = event.pop("impactLevel")
             tags = event.pop("entityTags")
             impacted_entities = event.pop("impactedEntities", [])
-            url = event.pop("ProblemURL")
+            url = event.pop("ProblemURL", None)
+            lastReceived = datetime.datetime.fromtimestamp(
+                event.pop("startTime") / 1000, tz=datetime.timezone.utc
+            )
             alert_dto = AlertDto(
-                id=id,
+                id=_id,
                 name=name,
                 status=status,
                 severity=severity,
-                lastReceived=datetime.datetime.now().isoformat(),
-                fatigueMeter=random.randint(0, 100),
+                lastReceived=lastReceived.isoformat(),
                 description=description,
                 source=["dynatrace"],
                 impact=impact,
@@ -257,6 +289,9 @@ class DynatraceProvider(BaseProvider):
                 url=url,
                 **event,  # any other field
             )
+        alert_dto.fingerprint = DynatraceProvider.get_alert_fingerprint(
+            alert_dto, DynatraceProvider.FINGERPRINT_FIELDS
+        )
         return alert_dto
 
     def _get_alerting_profiles(self):
@@ -336,7 +371,7 @@ class DynatraceProvider(BaseProvider):
                 "notifyClosedProblems": True,
                 "notifyEventMergesEnabled": True,
                 # all the fields - https://docs.dynatrace.com/docs/observe-and-explore/notifications-and-alerting/problem-notifications/webhook-integration#example-json-with-placeholders
-                "payload": '{\n"State":"{State}",\n"ProblemID":"{ProblemID}",\n"ProblemTitle":"{ProblemTitle}",\n"ImpactedEntities": {ImpactedEntities},\n "PID": "{PID}",\n "ProblemDetailsJSON": {ProblemDetailsJSON},\n "ProblemImpact" : "{ProblemImpact}",\n"ProblemSeverity": "{ProblemSeverity}",\n "ProblemURL": "{ProblemURL}",\n"State": "{State}",\n"Tags": "{Tags}"\n"ProblemDetails": "{ProblemDetailsText}"\n"NamesOfImpactedEntities": "{NamesOfImpactedEntities}"\n"ImpactedEntity": "{ImpactedEntity}"\n"ImpactedEntityNames": "{ImpactedEntityNames}"\n"ProblemDetailsJSONv2": {ProblemDetailsJSONv2}\n\n}',
+                "payload": '{\n"State":"{State}",\n"ProblemID":"{ProblemID}",\n"ProblemTitle":"{ProblemTitle}",\n"ImpactedEntities": {ImpactedEntities},\n "PID": "{PID}",\n "ProblemDetailsJSON": {ProblemDetailsJSON},\n "ProblemImpact" : "{ProblemImpact}",\n"ProblemSeverity": "{ProblemSeverity}",\n "ProblemURL": "{ProblemURL}",\n"State": "{State}",\n"Tags": "{Tags}",\n"ProblemDetails": "{ProblemDetailsText}",\n"NamesOfImpactedEntities": "{NamesOfImpactedEntities}",\n"ImpactedEntity": "{ImpactedEntity}",\n"ImpactedEntityNames": "{ImpactedEntityNames}",\n"ProblemDetailsJSONv2": {ProblemDetailsJSONv2}\n}',
             },
         }
         actual_payload = [

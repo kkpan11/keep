@@ -1,11 +1,18 @@
-
 // AuthenticationType.ts
 
-export enum AuthenticationType {
-    MULTI_TENANT = "MULTI_TENANT",
-    SINGLE_TENANT = "SINGLE_TENANT",
-    NO_AUTH = "NO_AUTH"  // Default
+export enum AuthType {
+  AUTH0 = "AUTH0",
+  DB = "DB",
+  KEYCLOAK = "KEYCLOAK",
+  OAUTH2PROXY = "OAUTH2PROXY",
+  AZUREAD = "AZUREAD",
+  NOAUTH = "NOAUTH", // Default
 }
 
-export const NoAuthUserEmail = "keep@example.com";
+// Backward compatibility
+export const MULTI_TENANT = "MULTI_TENANT";
+export const SINGLE_TENANT = "SINGLE_TENANT";
+export const NO_AUTH = "NO_AUTH";
+
+export const NoAuthUserEmail = "keep";
 export const NoAuthTenant = "keep";

@@ -1,5 +1,3 @@
-import asyncio
-import inspect
 import time
 from enum import Enum
 
@@ -31,18 +29,20 @@ class Step:
         self.step_id = step_id
         self.step_type = step_type
         self.provider = provider
-        self.provider_parameters: dict[
-            str, str | StepProviderParameter
-        ] = provider_parameters
+        self.provider_parameters: dict[str, str | StepProviderParameter] = (
+            provider_parameters
+        )
         self.on_failure = self.config.get("provider", {}).get("on-failure", {})
         self.context_manager: ContextManager = context_manager
         self.io_handler = IOHandler(context_manager)
         self.conditions = self.config.get("condition", [])
+        self.vars = self.config.get("vars", {})
         self.conditions_results = {}
         self.logger = context_manager.get_logger()
         self.__retry = self.on_failure.get("retry", {})
         self.__retry_count = self.__retry.get("count", 0)
         self.__retry_interval = self.__retry.get("interval", 0)
+        self.__continue_to_next_step = self.config.get("continue", True)
 
     @property
     def foreach(self):
@@ -51,6 +51,10 @@ class Step:
     @property
     def name(self):
         return self.step_id
+
+    @property
+    def continue_to_next_step(self):
+        return self.__continue_to_next_step
 
     def run(self):
         try:
@@ -61,7 +65,13 @@ class Step:
             return did_action_run
         except Exception as e:
             self.logger.error(
-                "Failed to run step %s with error %s", self.step_id, e, exc_info=True
+                "Failed to run step %s with error %s",
+                self.step_id,
+                e,
+                extra={
+                    "step_id": self.step_id,
+                },
+                exc_info=True,
             )
             raise ActionError(e)
 
@@ -73,25 +83,34 @@ class Step:
 
         throttling_type = throttling.get("type")
         throttling_config = throttling.get("with")
-        throttle = ThrottleFactory.get_instance(throttling_type, throttling_config)
-        alert_id = self.context_manager.get_workflow_id()
-        return throttle.check_throttling(action_name, alert_id)
+        throttle = ThrottleFactory.get_instance(
+            self.context_manager, throttling_type, throttling_config
+        )
+        workflow_id = self.context_manager.get_workflow_id()
+        event_id = self.context_manager.event_context.event_id
+        return throttle.check_throttling(action_name, workflow_id, event_id)
 
-    def _get_foreach_items(self):
+    def _get_foreach_items(self) -> list | list[list]:
         """Get the items to iterate over, when using the `foreach` attribute (see foreach.md)"""
         # TODO: this should be part of iohandler?
 
         # the item holds the value we are going to iterate over
         # TODO: currently foreach will support only {{ a.b.c }} and not functions and other things (which make sense)
-        index = (
-            self.config.get("foreach").replace("{{", "").replace("}}", "").split(".")
-        )
-        index = [i.strip() for i in index]
-        items = self.context_manager.get_full_context()
-        for i in index:
-            # try to get it as a dict
-            items = items.get(i, {})
-        return items
+        foreach_split = self.config.get("foreach").split("&&")
+        foreach_items = []
+        for foreach in foreach_split:
+            index = foreach.replace("{{", "").replace("}}", "").split(".")
+            index = [i.strip() for i in index]
+            items = self.context_manager.get_full_context()
+            for i in index:
+                if isinstance(items, dict):
+                    items = items.get(i, {})
+                else:
+                    items = getattr(items, i, {})
+            foreach_items.append(items)
+        if not foreach_items:
+            return []
+        return len(foreach_items) == 1 and foreach_items[0] or zip(*foreach_items)
 
     def _run_foreach(self):
         """Evaluate the action for each item, when using the `foreach` attribute (see foreach.md)"""
@@ -101,7 +120,16 @@ class Step:
         # apply ALL conditions (the decision whether to run or not is made in the end)
         for item in items:
             self.context_manager.set_for_each_context(item)
-            did_action_run = self._run_single()
+            try:
+                did_action_run = self._run_single()
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to run action with error {e}",
+                    extra={
+                        "step_id": self.step_id,
+                    },
+                )
+                continue
             # If at least one item triggered an action, return True
             # TODO - do it per item
             if did_action_run:
@@ -111,6 +139,7 @@ class Step:
     def _run_single(self):
         # Initialize all conditions
         conditions = []
+        self.context_manager.set_step_vars(self.step_id, _vars=self.vars)
 
         for condition in self.conditions:
             condition_name = condition.get("name", None)
@@ -139,6 +168,9 @@ class Step:
                     "Failed to apply condition %s with error %s",
                     condition.condition_name,
                     e,
+                    extra={
+                        "step_id": self.step_id,
+                    },
                 )
                 raise
             self.context_manager.set_condition_results(
@@ -184,6 +216,7 @@ class Step:
                     extra={
                         "condition": if_conf,
                         "rendered": if_met,
+                        "step_id": self.step_id,
                     },
                 )
                 raise Exception(
@@ -193,110 +226,114 @@ class Step:
         else:
             evaluated_if_met = True
 
+        action_name = self.config.get("name")
         if not evaluated_if_met:
             self.logger.info(
-                "Action %s evaluated NOT to run, Reason: %s evaluated to false.",
-                self.config.get("name"),
-                if_conf,
+                f"Action {action_name} evaluated NOT to run, Reason: {if_met} evaluated to false.",
+                extra={
+                    "condition": if_conf,
+                    "rendered": if_met,
+                    "step_id": self.step_id,
+                },
             )
             return
 
         if if_conf:
             self.logger.info(
-                "Action %s evaluated to run! Reason: %s evaluated to true.",
-                self.config.get("name"),
-                if_conf,
+                f"Action {action_name} evaluated to run! Reason: {if_met} evaluated to true.",
+                extra={
+                    "condition": if_conf,
+                    "rendered": if_met,
+                    "step_id": self.step_id,
+                },
             )
         else:
             self.logger.info(
                 "Action %s evaluated to run! Reason: no condition, hence true.",
                 self.config.get("name"),
+                extra={
+                    "step_id": self.step_id,
+                },
             )
 
         # Third, check throttling
         # Now check if throttling is enabled
+        self.logger.info(
+            "Checking throttling for action %s",
+            self.config.get("name"),
+            extra={
+                "step_id": self.step_id,
+            },
+        )
         throttled = self._check_throttling(self.config.get("name"))
         if throttled:
-            self.logger.info("Action %s is throttled", self.config.get("name"))
+            self.logger.info(
+                "Action %s is throttled",
+                self.config.get("name"),
+                extra={
+                    "step_id": self.step_id,
+                },
+            )
             return
+        self.logger.info(
+            "Action %s is not throttled",
+            self.config.get("name"),
+            extra={
+                "step_id": self.step_id,
+            },
+        )
 
         # Last, run the action
-        # if the provider is async, run it in a new event loop
-        if inspect.iscoroutinefunction(self.provider.notify):
-            self._run_single_async()
-        # else, just run the provider
-        else:
-            try:
-                rendered_providers_parameters = self.io_handler.render_context(
-                    self.provider_parameters
+        try:
+            rendered_providers_parameters = self.io_handler.render_context(
+                self.provider_parameters
+            )
+
+            for curr_retry_count in range(self.__retry_count + 1):
+                self.logger.info(
+                    f"Running {self.step_id} {self.step_type}, current retry: {curr_retry_count}",
+                    extra={
+                        "step_id": self.step_id,
+                    },
                 )
-
-                for curr_retry_count in range(self.__retry_count + 1):
-                    try:
-                        if self.step_type == StepType.STEP:
-                            step_output = self.provider.query(
-                                **rendered_providers_parameters
-                            )
-                            self.context_manager.set_step_context(
-                                self.step_id, results=step_output, foreach=self.foreach
-                            )
-                        else:
-                            self.provider.notify(**rendered_providers_parameters)
-                        # exiting the loop as step/action execution was successful
-                        break
-                    except Exception as e:
-                        if curr_retry_count == self.__retry_count:
-                            raise StepError(e)
-                        else:
-                            self.logger.info(
-                                "Retrying running %s step after %s second(s)...",
-                                self.step_id,
-                                self.__retry_interval,
-                            )
-
-                            time.sleep(self.__retry_interval)
-
-                extra_context = self.provider.expose()
-                rendered_providers_parameters.update(extra_context)
-                self.context_manager.set_step_provider_paremeters(
-                    self.step_id, rendered_providers_parameters
-                )
-            except Exception as e:
-                raise StepError(e)
-
-            return True
-
-    def _run_single_async(self):
-        """For async providers, run them in a new event loop
-
-        Raises:
-            ActionError: _description_
-        """
-        rendered_value = self.io_handler.render_context(self.provider_parameters)
-        # This is "magically solved" because of nest_asyncio but probably isn't best practice
-        loop = asyncio.new_event_loop()
-        if self.step_type == StepType.STEP:
-            task = loop.create_task(self.provider.query(**rendered_value))
-        else:
-            task = loop.create_task(self.provider.notify(**rendered_value))
-
-        for curr_retry_count in range(self.__retry_count + 1):
-            try:
-                loop.run_until_complete(task)
-
-                # exiting the loop as the task execution was successful
-                break
-            except Exception as e:
-                if curr_retry_count == self.__retry_count:
-                    raise ActionError(e)
-                else:
-                    self.logger.info(
-                        "Retrying running %s step after %s second(s)...",
-                        self.step_id,
-                        self.__retry_interval,
+                try:
+                    if self.step_type == StepType.STEP:
+                        step_output = self.provider.query(
+                            **rendered_providers_parameters
+                        )
+                    else:
+                        step_output = self.provider.notify(
+                            **rendered_providers_parameters
+                        )
+                    # exiting the loop as step/action execution was successful
+                    self.context_manager.set_step_context(
+                        self.step_id, results=step_output, foreach=self.foreach
                     )
+                    break
+                except Exception as e:
+                    if curr_retry_count == self.__retry_count:
+                        raise StepError(e)
+                    else:
+                        self.logger.info(
+                            "Retrying running %s step after %s second(s)...",
+                            self.step_id,
+                            self.__retry_interval,
+                            extra={
+                                "step_id": self.step_id,
+                            },
+                        )
 
-                    time.sleep(self.__retry_interval)
+                        time.sleep(self.__retry_interval)
+
+            extra_context = self.provider.expose()
+            rendered_providers_parameters.update(extra_context)
+            self.context_manager.set_step_provider_paremeters(
+                self.step_id, rendered_providers_parameters
+            )
+        except Exception as e:
+            raise StepError(e)
+
+        return True
 
 
 class StepError(Exception):
